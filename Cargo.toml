@@ -12,7 +12,7 @@ exclude = [
 resolver = "2"
 
 [workspace.dependencies]
-libbpf-rs = "0.21"
+libbpf-rs = "0.26"
 libbpf-sys = "1.4"
 tokio = { version = "1.35", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -11,7 +11,7 @@ path = "src/main.rs"
 bpfjailer-common = { path = "../bpfjailer-common" }
 bpfjailer-client = { path = "../bpfjailer-client" }
 libbpf-rs = "0.21"
-libbpf-sys = "1.4"
+libbpf-sys = "1.6"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

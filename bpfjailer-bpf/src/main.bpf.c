@@ -81,19 +81,21 @@ struct {
 
 #define MAX_PATH_DEPTH 32       // Max directory depth to walk
 #define PATH_STATE_ROOT 0       // Starting state
-#define PATH_STATE_ACCEPT 0xFFFFFFFE  // Accept (allow)
-#define PATH_STATE_REJECT 0xFFFFFFFF  // Reject (deny)
+// Sentinels live in the same space as the 64-bit state hashes, so they sit at
+// the top of the range where a real FNV-1a digest is vanishingly unlikely.
+#define PATH_STATE_ACCEPT 0xFFFFFFFFFFFFFFFEULL  // Accept (allow)
+#define PATH_STATE_REJECT 0xFFFFFFFFFFFFFFFFULL  // Reject (deny)
 
 // State transition key: current_state + component_hash -> next_state
 struct path_state_key {
     u32 role_id;
-    u32 state;           // Current state
-    u32 component_hash;  // Hash of path component (e.g., "var", "www")
+    u64 state;           // Current state
+    u64 component_hash;  // Hash of path component (e.g., "var", "www")
 };
 
 // State transition value
 struct path_state_value {
-    u32 next_state;      // Next state after this component
+    u64 next_state;      // Next state after this component
     u8 is_terminal;      // 1 if this is a final decision
     u8 decision;         // If terminal: 1=allow, 0=deny
     u8 wildcard;         // 1 if this matches any component (like *)
@@ -212,7 +214,7 @@ struct {
 // Domain rules map: hash of domain -> allowed (1) or blocked (0)
 struct domain_rule_key {
     u32 role_id;
-    u32 domain_hash;  // djb2 hash of domain name
+    u64 domain_hash;  // FNV-1a 64 hash of domain name
 };
 
 struct {
@@ -229,7 +231,7 @@ struct dns_cache_key {
 };
 
 struct dns_cache_value {
-    u32 domain_hash;  // Hash of the domain that resolved to this IP
+    u64 domain_hash;  // Hash of the domain that resolved to this IP
     u64 timestamp;    // When this entry was added (for TTL)
 };
 
@@ -295,8 +297,15 @@ static __always_inline void emit_audit_event(void *ctx, u32 pid, u32 role_id,
 #define MAX_COMPONENTS 16
 #define MAX_COMPONENT_LEN 64
 
+// Bytes of each path component fed into the hash. Must stay in lockstep with
+// the userspace hash in bpfjailer-daemon/src/bpf_loader.rs and
+// bpfjailer-bootstrap/src/main.rs -- both sides must agree byte for byte.
+#define MAX_COMPONENT_HASH_LEN 64
+#define FNV1A64_OFFSET_BASIS 0xcbf29ce484222325ULL
+#define FNV1A64_PRIME        0x00000100000001b3ULL
+
 struct path_components {
-    u32 hashes[MAX_COMPONENTS];  // Hash of each component
+    u64 hashes[MAX_COMPONENTS];  // Hash of each component
     u8 count;                     // Number of components collected
 };
 
@@ -307,21 +316,43 @@ struct {
     __type(value, struct path_components);
 } path_buf SEC(".maps");
 
-// Simple hash for path component (djb2 variant)
-static __always_inline u32 hash_component(const unsigned char *name, u32 len)
+// FNV-1a (64-bit) over the whole component, with the length mixed in.
+//
+// Replaces a 32-bit djb2 that hashed only the first 32 bytes. That combination
+// produced two classes of false-positive policy match:
+//
+//   1. Short collisions from the weak 32-bit mix, e.g. ".ssh" and "01sh" both
+//      hashed to 0x7c784161, as did ".aws" and ".axR".
+//   2. Any two components sharing a 32-byte prefix collided outright, because
+//      everything past byte 32 was discarded.
+//
+// The wider digest addresses (1). Hashing up to MAX_COMPONENT_HASH_LEN bytes
+// and folding in the length addresses (2) for names within that bound.
+//
+// This is still an unkeyed hash, so it resists accidental collisions rather
+// than an attacker computing one offline. See the note in the module docs.
+static __always_inline u64 hash_component(const unsigned char *name, u32 len)
 {
-    u32 hash = 5381;
+    u64 hash = FNV1A64_OFFSET_BASIS;
+    u32 hashed = 0;
 
     #pragma unroll
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < MAX_COMPONENT_HASH_LEN; i++) {
         if (i >= len)
             break;
         unsigned char c = 0;
         bpf_probe_read_kernel(&c, 1, &name[i]);
         if (c == 0)
             break;
-        hash = ((hash << 5) + hash) + c;
+        hash ^= (u64)c;
+        hash *= FNV1A64_PRIME;
+        hashed++;
     }
+
+    // Fold in the byte count so components sharing a prefix but differing in
+    // length cannot alias to the same digest.
+    hash ^= (u64)hashed;
+    hash *= FNV1A64_PRIME;
     return hash;
 }
 

@@ -279,7 +279,7 @@ fn add_path_state(map: &libbpf_rs::Map, role_id: u32, pattern: &str, allowed: bo
         return Ok(());
     }
 
-    let mut state: u32 = 0;
+    let mut state: u64 = 0;
 
     for (i, component) in components.iter().enumerate() {
         let is_last = i == components.len() - 1;
@@ -287,30 +287,34 @@ fn add_path_state(map: &libbpf_rs::Map, role_id: u32, pattern: &str, allowed: bo
         let component_hash = if is_wildcard {
             0
         } else {
-            djb2_hash_u32(component)
+            bpfjailer_common::hash::fnv1a_hash_u64(component)
         };
 
-        let mut key = [0u8; 12];
+        let mut key = [0u8; 24];
         key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        key[4..8].copy_from_slice(&state.to_ne_bytes());
-        key[8..12].copy_from_slice(&component_hash.to_ne_bytes());
+        key[8..16].copy_from_slice(&state.to_ne_bytes());
+        key[16..24].copy_from_slice(&component_hash.to_ne_bytes());
 
         let next_state = if is_last {
             if allowed {
-                0xFFFFFFFE
+                0xFFFF_FFFF_FFFF_FFFE_u64
             } else {
-                0xFFFFFFFF
+                0xFFFF_FFFF_FFFF_FFFF_u64
             }
         } else {
-            djb2_hash_u32(&format!("{}:{}", role_id, components[..=i].join("/")))
+            bpfjailer_common::hash::fnv1a_hash_u64(&format!(
+                "{}:{}",
+                role_id,
+                components[..=i].join("/")
+            ))
         };
 
-        let mut value = [0u8; 8];
-        value[0..4].copy_from_slice(&next_state.to_ne_bytes());
-        value[4] = if is_last { 1 } else { 0 };
-        value[5] = if allowed { 1 } else { 0 };
-        value[6] = if is_wildcard { 1 } else { 0 };
-        value[7] = 0;
+        let mut value = [0u8; 16];
+        value[0..8].copy_from_slice(&next_state.to_ne_bytes());
+        value[8] = if is_last { 1 } else { 0 };
+        value[9] = if allowed { 1 } else { 0 };
+        value[10] = if is_wildcard { 1 } else { 0 };
+        value[11] = 0;
 
         map.update(&key, &value, MapFlags::empty())?;
         state = next_state;
@@ -318,18 +322,22 @@ fn add_path_state(map: &libbpf_rs::Map, role_id: u32, pattern: &str, allowed: bo
 
     // Handle directory patterns (ending with /)
     if pattern.ends_with('/') {
-        let mut key = [0u8; 12];
+        let mut key = [0u8; 24];
         key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        key[4..8].copy_from_slice(&state.to_ne_bytes());
-        key[8..12].copy_from_slice(&0u32.to_ne_bytes());
+        key[8..16].copy_from_slice(&state.to_ne_bytes());
+        key[16..24].copy_from_slice(&0u64.to_ne_bytes());
 
-        let terminal_state: u32 = if allowed { 0xFFFFFFFE } else { 0xFFFFFFFF };
-        let mut value = [0u8; 8];
-        value[0..4].copy_from_slice(&terminal_state.to_ne_bytes());
-        value[4] = 1;
-        value[5] = if allowed { 1 } else { 0 };
-        value[6] = 1;
-        value[7] = 0;
+        let terminal_state: u64 = if allowed {
+            0xFFFF_FFFF_FFFF_FFFE
+        } else {
+            0xFFFF_FFFF_FFFF_FFFF
+        };
+        let mut value = [0u8; 16];
+        value[0..8].copy_from_slice(&terminal_state.to_ne_bytes());
+        value[8] = 1;
+        value[9] = if allowed { 1 } else { 0 };
+        value[10] = 1;
+        value[11] = 0;
 
         map.update(&key, &value, MapFlags::empty())?;
     }
@@ -423,14 +431,6 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
 
     log::info!("All BPF objects pinned successfully");
     Ok(())
-}
-
-fn djb2_hash_u32(s: &str) -> u32 {
-    let mut hash: u32 = 5381;
-    for c in s.bytes().take(32) {
-        hash = hash.wrapping_mul(33).wrapping_add(c as u32);
-    }
-    hash
 }
 
 fn flags_to_byte(flags: &bpfjailer_common::types::PolicyFlags) -> u8 {

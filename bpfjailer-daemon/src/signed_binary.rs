@@ -7,6 +7,9 @@ pub struct SignedBinaryManager {
     _bpf: Arc<BpfJailerBpf>,
 }
 
+// Signature validation is not wired up yet (README lists it as a stub), so
+// these are intentionally unreferenced until the enforcement path lands.
+#[allow(dead_code)]
 impl SignedBinaryManager {
     pub fn new(bpf: Arc<BpfJailerBpf>) -> Result<Self> {
         info!("Initializing signed binary manager");

@@ -84,7 +84,7 @@ impl PolicyManager {
         self.config = serde_json::from_str(&content)?;
 
         self.role_map.clear();
-        for (_name, role) in &self.config.roles {
+        for role in self.config.roles.values() {
             self.role_map.insert(role.id, Arc::new(role.clone()));
         }
 

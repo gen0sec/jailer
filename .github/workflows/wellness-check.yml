@@ -1,0 +1,106 @@
+name: Wellness Check
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The BPF objects are produced by bpfjailer-bpf/build.rs via clang and are
+# loaded at runtime, so clang/llvm/libelf are needed by anything that touches
+# the workspace -- including `cargo clippy` and `cargo doc`.
+
+jobs:
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  machete:
+    name: Unused dependencies
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bnjbvr/cargo-machete@main
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - run: cargo clippy --locked --workspace --all-targets -- --deny warnings
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-24.04
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: doc
+      - run: cargo doc --locked --workspace --no-deps
+
+  unit-tests:
+    name: Unit tests
+    needs: [fmt, clippy]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: unit-tests
+      - run: cargo test --locked --workspace --lib
+
+  miri:
+    name: Miri (UB detector)
+    needs: [fmt, clippy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-permissive-provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # Restricted to bpfjailer-common: the bootstrap/daemon crates wrap
+      # libbpf via FFI and load BPF objects, which miri cannot model.
+      # bpfjailer-common is pure-Rust policy and type definitions.
+      - run: cargo +nightly miri test -p bpfjailer-common --lib

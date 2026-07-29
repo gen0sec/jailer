@@ -1,3 +1,4 @@
+pub mod codec;
 pub mod flags;
 pub mod hash;
 pub mod policy;

@@ -270,85 +270,11 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
 }
 
 fn add_path_state(map: &libbpf_rs::Map, role_id: u32, pattern: &str, allowed: bool) -> Result<()> {
-    let components: Vec<&str> = pattern
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != "**")
-        .collect();
-
-    if components.is_empty() {
-        return Ok(());
-    }
-
-    let mut state: u64 = 0;
-
-    for (i, component) in components.iter().enumerate() {
-        let is_last = i == components.len() - 1;
-        let is_wildcard = *component == "*";
-        let component_hash = if is_wildcard {
-            0
-        } else {
-            bpfjailer_common::hash::fnv1a_hash_u64(component)
-        };
-
-        let mut key = [0u8; 24];
-        key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        key[8..16].copy_from_slice(&state.to_ne_bytes());
-        key[16..24].copy_from_slice(&component_hash.to_ne_bytes());
-
-        let next_state = if is_last {
-            if allowed {
-                0xFFFF_FFFF_FFFF_FFFE_u64
-            } else {
-                0xFFFF_FFFF_FFFF_FFFF_u64
-            }
-        } else {
-            bpfjailer_common::hash::fnv1a_hash_u64(&format!(
-                "{}:{}",
-                role_id,
-                components[..=i].join("/")
-            ))
-        };
-
-        let mut value = [0u8; 16];
-        value[0..8].copy_from_slice(&next_state.to_ne_bytes());
-        value[8] = if is_last { 1 } else { 0 };
-        value[9] = if allowed { 1 } else { 0 };
-        value[10] = if is_wildcard { 1 } else { 0 };
-        value[11] = 0;
-
-        map.update(&key, &value, MapFlags::empty())?;
-        state = next_state;
-    }
-
-    // Handle directory patterns (ending with /)
-    if pattern.ends_with('/') {
-        let mut key = [0u8; 24];
-        key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        key[8..16].copy_from_slice(&state.to_ne_bytes());
-        key[16..24].copy_from_slice(&0u64.to_ne_bytes());
-
-        let terminal_state: u64 = if allowed {
-            0xFFFF_FFFF_FFFF_FFFE
-        } else {
-            0xFFFF_FFFF_FFFF_FFFF
-        };
-        let mut value = [0u8; 16];
-        value[0..8].copy_from_slice(&terminal_state.to_ne_bytes());
-        value[8] = 1;
-        value[9] = if allowed { 1 } else { 0 };
-        value[10] = 1;
-        value[11] = 0;
-
+    // Shared with the daemon: both sides must produce byte-identical keys, so
+    // the walk lives in bpfjailer_common::codec rather than being duplicated.
+    for (key, value) in bpfjailer_common::codec::path_state_entries(role_id, pattern, allowed) {
         map.update(&key, &value, MapFlags::empty())?;
     }
-
-    log::debug!(
-        "Path state: role={} pattern=\"{}\" -> {}",
-        role_id,
-        pattern,
-        if allowed { "ALLOW" } else { "DENY" }
-    );
-
     Ok(())
 }
 

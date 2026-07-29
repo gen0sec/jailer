@@ -269,12 +269,7 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
     Ok(())
 }
 
-fn add_path_state(
-    map: &libbpf_rs::Map,
-    role_id: u32,
-    pattern: &str,
-    allowed: bool,
-) -> Result<()> {
+fn add_path_state(map: &libbpf_rs::Map, role_id: u32, pattern: &str, allowed: bool) -> Result<()> {
     let components: Vec<&str> = pattern
         .split('/')
         .filter(|s| !s.is_empty() && *s != "**")

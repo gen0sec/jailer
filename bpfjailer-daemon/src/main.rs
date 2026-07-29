@@ -1,9 +1,9 @@
 mod bpf_loader;
-mod process_tracker;
-mod policy;
 mod enrollment;
 mod enrollment_alternatives;
 mod path_matcher;
+mod policy;
+mod process_tracker;
 mod signed_binary;
 
 use anyhow::Result;
@@ -35,17 +35,15 @@ async fn main() -> Result<()> {
     let mut policy_manager = policy::PolicyManager::new()?;
 
     // Load policy from file if available
-    let policy_path = env::var("BPFJAILER_POLICY")
-        .ok()
-        .or_else(|| {
-            if Path::new(DEFAULT_POLICY_PATH).exists() {
-                Some(DEFAULT_POLICY_PATH.to_string())
-            } else if Path::new(LOCAL_POLICY_PATH).exists() {
-                Some(LOCAL_POLICY_PATH.to_string())
-            } else {
-                None
-            }
-        });
+    let policy_path = env::var("BPFJAILER_POLICY").ok().or_else(|| {
+        if Path::new(DEFAULT_POLICY_PATH).exists() {
+            Some(DEFAULT_POLICY_PATH.to_string())
+        } else if Path::new(LOCAL_POLICY_PATH).exists() {
+            Some(LOCAL_POLICY_PATH.to_string())
+        } else {
+            None
+        }
+    });
 
     if let Some(path) = policy_path {
         match policy_manager.load_from_file(&path).await {
@@ -64,7 +62,10 @@ async fn main() -> Result<()> {
     // Compile path patterns from loaded policy and invalidate cache
     {
         let pm = policy_manager.read().await;
-        let all_patterns: Vec<String> = pm.config().roles.values()
+        let all_patterns: Vec<String> = pm
+            .config()
+            .roles
+            .values()
             .flat_map(|role| role.file_paths.iter().map(|p| p.pattern.clone()))
             .collect();
         drop(pm);

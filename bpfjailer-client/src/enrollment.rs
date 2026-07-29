@@ -47,14 +47,8 @@ pub enum EnrollmentRequest {
 pub enum EnrollmentResponse {
     Success,
     Error(String),
-    ProcessInfo {
-        pod_id: PodId,
-        role_id: RoleId,
-    },
-    XattrInfo {
-        pod_id: PodId,
-        role_id: RoleId,
-    },
+    ProcessInfo { pod_id: PodId, role_id: RoleId },
+    XattrInfo { pod_id: PodId, role_id: RoleId },
 }
 
 pub struct EnrollmentClient {
@@ -83,8 +77,8 @@ impl EnrollmentClient {
         let mut response_buf = Vec::new();
         stream.read_to_end(&mut response_buf).await?;
 
-        let response: EnrollmentResponse = serde_json::from_slice(&response_buf)
-            .context("Failed to parse enrollment response")?;
+        let response: EnrollmentResponse =
+            serde_json::from_slice(&response_buf).context("Failed to parse enrollment response")?;
 
         match response {
             EnrollmentResponse::Success => Ok(()),
@@ -108,8 +102,8 @@ impl EnrollmentClient {
         let mut response_buf = Vec::new();
         stream.read_to_end(&mut response_buf).await?;
 
-        let response: EnrollmentResponse = serde_json::from_slice(&response_buf)
-            .context("Failed to parse query response")?;
+        let response: EnrollmentResponse =
+            serde_json::from_slice(&response_buf).context("Failed to parse query response")?;
 
         match response {
             EnrollmentResponse::ProcessInfo { pod_id, role_id } => Ok((pod_id, role_id)),

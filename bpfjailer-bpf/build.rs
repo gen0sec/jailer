@@ -58,23 +58,30 @@ fn compile_bpf_program(src: &str, output: &str) {
     }
 
     args.extend_from_slice(&[
-        "-O2".to_string(), "-g".to_string(),
-        "-target".to_string(), "bpfel-unknown-none".to_string(),
-        "-c".to_string(), src.to_string(),
-        "-o".to_string(), output.to_string(),
+        "-O2".to_string(),
+        "-g".to_string(),
+        "-target".to_string(),
+        "bpfel-unknown-none".to_string(),
+        "-c".to_string(),
+        src.to_string(),
+        "-o".to_string(),
+        output.to_string(),
         "-Wno-unknown-attributes".to_string(),
         "-Wno-address-of-packed-member".to_string(),
         "-Wno-unused-value".to_string(),
         "-Wno-pointer-sign".to_string(),
         // Enable BTF for task_storage maps
-        "-g".to_string(),  // Already have this, but ensure it's there for BTF
+        "-g".to_string(), // Already have this, but ensure it's there for BTF
     ]);
 
     cmd.args(&args);
 
     let output_cmd = cmd.output().expect("Failed to execute clang");
     if !output_cmd.status.success() {
-        eprintln!("Clang stderr: {}", String::from_utf8_lossy(&output_cmd.stderr));
+        eprintln!(
+            "Clang stderr: {}",
+            String::from_utf8_lossy(&output_cmd.stderr)
+        );
         eprintln!("Clang command: clang {}", args.join(" "));
         panic!("Failed to compile BPF program: {}", src);
     }

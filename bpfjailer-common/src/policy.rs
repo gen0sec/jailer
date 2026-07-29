@@ -1,6 +1,6 @@
+use crate::types::{PolicyFlags, RoleId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::types::{RoleId, PolicyFlags};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathPattern {
@@ -151,72 +151,125 @@ impl SecretPatterns {
     pub fn all() -> Vec<PathPattern> {
         vec![
             // Environment variables (API keys, tokens)
-            PathPattern { pattern: "/proc/".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/proc/".to_string(),
+                allow: false,
+            },
             // SSH keys
-            PathPattern { pattern: "/.ssh/".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/.ssh/".to_string(),
+                allow: false,
+            },
             // AWS credentials
-            PathPattern { pattern: "/.aws/".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/.aws/".to_string(),
+                allow: false,
+            },
             // Google Cloud credentials
-            PathPattern { pattern: "/.config/gcloud/".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/.config/gcloud/".to_string(),
+                allow: false,
+            },
             // Azure credentials
-            PathPattern { pattern: "/.azure/".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/.azure/".to_string(),
+                allow: false,
+            },
             // Kubernetes config
-            PathPattern { pattern: "/.kube/".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/.kube/".to_string(),
+                allow: false,
+            },
             // Docker config (contains registry credentials)
-            PathPattern { pattern: "/.docker/".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/.docker/".to_string(),
+                allow: false,
+            },
             // System password files
-            PathPattern { pattern: "/etc/shadow".to_string(), allow: false },
-            PathPattern { pattern: "/etc/gshadow".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/etc/shadow".to_string(),
+                allow: false,
+            },
+            PathPattern {
+                pattern: "/etc/gshadow".to_string(),
+                allow: false,
+            },
             // Common private key locations
-            PathPattern { pattern: "/etc/ssl/private/".to_string(), allow: false },
-            PathPattern { pattern: "/etc/pki/".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/etc/ssl/private/".to_string(),
+                allow: false,
+            },
+            PathPattern {
+                pattern: "/etc/pki/".to_string(),
+                allow: false,
+            },
             // npm/yarn tokens
-            PathPattern { pattern: "/.npmrc".to_string(), allow: false },
-            PathPattern { pattern: "/.yarnrc".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/.npmrc".to_string(),
+                allow: false,
+            },
+            PathPattern {
+                pattern: "/.yarnrc".to_string(),
+                allow: false,
+            },
             // Git credentials
-            PathPattern { pattern: "/.git-credentials".to_string(), allow: false },
-            PathPattern { pattern: "/.netrc".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/.git-credentials".to_string(),
+                allow: false,
+            },
+            PathPattern {
+                pattern: "/.netrc".to_string(),
+                allow: false,
+            },
             // Python/pip
-            PathPattern { pattern: "/.pypirc".to_string(), allow: false },
-
+            PathPattern {
+                pattern: "/.pypirc".to_string(),
+                allow: false,
+            },
             // GPG keys
-            PathPattern { pattern: "/.gnupg/".to_string(), allow: false },
+            PathPattern {
+                pattern: "/.gnupg/".to_string(),
+                allow: false,
+            },
         ]
     }
 
     /// Get patterns for SSH key protection only
     pub fn ssh_keys() -> Vec<PathPattern> {
-        vec![
-            PathPattern { pattern: "/.ssh/".to_string(), allow: false },
-        ]
+        vec![PathPattern {
+            pattern: "/.ssh/".to_string(),
+            allow: false,
+        }]
     }
 
     /// Get patterns for cloud credentials protection
     pub fn cloud_credentials() -> Vec<PathPattern> {
         vec![
-            PathPattern { pattern: "/.aws/".to_string(), allow: false },
-            PathPattern { pattern: "/.config/gcloud/".to_string(), allow: false },
-            PathPattern { pattern: "/.azure/".to_string(), allow: false },
-            PathPattern { pattern: "/.kube/".to_string(), allow: false },
+            PathPattern {
+                pattern: "/.aws/".to_string(),
+                allow: false,
+            },
+            PathPattern {
+                pattern: "/.config/gcloud/".to_string(),
+                allow: false,
+            },
+            PathPattern {
+                pattern: "/.azure/".to_string(),
+                allow: false,
+            },
+            PathPattern {
+                pattern: "/.kube/".to_string(),
+                allow: false,
+            },
         ]
     }
 
     /// Get patterns for environment/process information protection
     pub fn process_info() -> Vec<PathPattern> {
-        vec![
-            PathPattern { pattern: "/proc/".to_string(), allow: false },
-        ]
+        vec![PathPattern {
+            pattern: "/proc/".to_string(),
+            allow: false,
+        }]
     }
 }
 
@@ -226,23 +279,31 @@ pub struct AllowedDomains;
 impl AllowedDomains {
     /// OpenAI API endpoints
     pub fn openai() -> Vec<DomainRule> {
-        vec![
-            DomainRule { domain: "api.openai.com".to_string(), allow: true },
-        ]
+        vec![DomainRule {
+            domain: "api.openai.com".to_string(),
+            allow: true,
+        }]
     }
 
     /// Anthropic API endpoints
     pub fn anthropic() -> Vec<DomainRule> {
-        vec![
-            DomainRule { domain: "api.anthropic.com".to_string(), allow: true },
-        ]
+        vec![DomainRule {
+            domain: "api.anthropic.com".to_string(),
+            allow: true,
+        }]
     }
 
     /// Google AI endpoints
     pub fn google_ai() -> Vec<DomainRule> {
         vec![
-            DomainRule { domain: "generativelanguage.googleapis.com".to_string(), allow: true },
-            DomainRule { domain: "aiplatform.googleapis.com".to_string(), allow: true },
+            DomainRule {
+                domain: "generativelanguage.googleapis.com".to_string(),
+                allow: true,
+            },
+            DomainRule {
+                domain: "aiplatform.googleapis.com".to_string(),
+                allow: true,
+            },
         ]
     }
 
@@ -252,8 +313,14 @@ impl AllowedDomains {
         rules.extend(Self::openai());
         rules.extend(Self::anthropic());
         rules.extend(Self::google_ai());
-        rules.push(DomainRule { domain: "api.cohere.ai".to_string(), allow: true });
-        rules.push(DomainRule { domain: "api.mistral.ai".to_string(), allow: true });
+        rules.push(DomainRule {
+            domain: "api.cohere.ai".to_string(),
+            allow: true,
+        });
+        rules.push(DomainRule {
+            domain: "api.mistral.ai".to_string(),
+            allow: true,
+        });
         rules
     }
 }

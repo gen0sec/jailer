@@ -48,11 +48,27 @@ impl ProcessTracker {
         Ok(())
     }
 
+    /// Look up a live process's pod and role.
+    ///
+    /// Returns `None` when the process is gone, or when the BPF side has not
+    /// yet populated task-local storage for it -- enrollment is staged in
+    /// `pending_enrollments` and migrates on the task's next hooked syscall,
+    /// so a just-enrolled process reads as `None` until it does anything.
     pub fn get_process_info(&self, pid: u32) -> Result<Option<(PodId, RoleId)>> {
-        // Task storage is managed by kernel, we can't directly query it from userspace
-        // This would need to be implemented via a separate eBPF program or map
         debug!("Querying process info for PID {}", pid);
-        Ok(None)
+        let Some(raw) = self.bpf.lookup_task_storage(pid)? else {
+            return Ok(None);
+        };
+        // struct process_info { u64 pod_id; u32 role_id; u8 stack_depth; u8 flags; }
+        if raw.len() < 12 {
+            return Err(anyhow::anyhow!(
+                "task_storage entry for pid {pid} is {} bytes, expected at least 12",
+                raw.len()
+            ));
+        }
+        let pod_id = u64::from_ne_bytes(raw[0..8].try_into().unwrap());
+        let role_id = u32::from_ne_bytes(raw[8..12].try_into().unwrap());
+        Ok(Some((PodId(pod_id), RoleId(role_id))))
     }
 
     #[allow(dead_code)]
@@ -279,21 +295,40 @@ mod root_integration {
         assert_eq!(u32::from_ne_bytes(v[8..12].try_into().unwrap()), 6);
     }
 
-    /// `get_process_info` is a stub: task storage cannot be read from
-    /// userspace, so it returns `None` unconditionally. This pins that
-    /// behaviour so a future implementation has to update the test
-    /// deliberately -- today any caller sees every process as unenrolled.
+    /// A pid that does not exist has no pidfd, so the lookup reports None
+    /// rather than erroring.
     #[test]
     #[ignore = "requires root"]
-    fn get_process_info_is_currently_always_none() {
+    fn get_process_info_is_none_for_a_dead_pid() {
         let t = tracker_or_skip!();
-        t.enroll_process(31338, PodId(89), RoleId(7))
-            .expect("enroll");
-        assert!(
-            t.get_process_info(31338).expect("query").is_none(),
-            "stub is documented to return None even for an enrolled pid"
-        );
         assert!(t.get_process_info(4_000_001).expect("query").is_none());
+    }
+
+    /// A live process with no task_storage entry reads as None. Storage is
+    /// only written by the BPF side once the programs are attached and the
+    /// task hits a hooked syscall, which does not happen here.
+    #[test]
+    #[ignore = "requires root"]
+    fn get_process_info_is_none_for_a_live_but_unenrolled_pid() {
+        let t = tracker_or_skip!();
+        assert!(t
+            .get_process_info(std::process::id())
+            .expect("query")
+            .is_none());
+    }
+
+    /// Enrollment is staged in pending_enrollments, so a just-enrolled pid
+    /// still reads as None until the BPF side migrates it.
+    #[test]
+    #[ignore = "requires root"]
+    fn enrollment_alone_does_not_populate_task_storage() {
+        let t = tracker_or_skip!();
+        t.enroll_process(std::process::id(), PodId(89), RoleId(7))
+            .expect("enroll");
+        assert!(t
+            .get_process_info(std::process::id())
+            .expect("query")
+            .is_none());
     }
 
     #[test]

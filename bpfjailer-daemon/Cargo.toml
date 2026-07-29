@@ -8,6 +8,7 @@ name = "bpfjailer-daemon"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 bpfjailer-common = { path = "../bpfjailer-common" }
 bpfjailer-client = { path = "../bpfjailer-client" }
 libbpf-rs = "0.21"

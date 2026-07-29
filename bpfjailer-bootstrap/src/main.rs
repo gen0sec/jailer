@@ -76,6 +76,20 @@ fn load_policy() -> Result<PolicyConfig> {
     log::info!("Loading policy from: {}", path);
     let content = fs::read_to_string(&path).context("Failed to read policy file")?;
     let config: PolicyConfig = serde_json::from_str(&content).context("Failed to parse policy")?;
+
+    // Refuse a policy asking for something this build does not enforce, rather
+    // than pinning it and looking protected. Same check as the daemon.
+    for (name, role) in &config.roles {
+        let unenforced = bpfjailer_common::flags::unenforced_flags(&role.flags);
+        if !unenforced.is_empty() {
+            anyhow::bail!(
+                "role '{}' requests {} which this build does not enforce; \
+                 remove the setting or do not rely on it",
+                name,
+                unenforced.join(", ")
+            );
+        }
+    }
     Ok(config)
 }
 
@@ -424,6 +438,28 @@ mod root_integration {
         let cfg = load_policy().expect("load");
         std::env::remove_var("BPFJAILER_POLICY");
         assert!(cfg.get_role("web").is_some());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn load_policy_refuses_an_unenforced_flag() {
+        let body = POLICY.replace(
+            r#""require_signed_binary": false, "allow_setuid": true"#,
+            r#""require_signed_binary": true, "allow_setuid": true"#,
+        );
+        assert!(
+            body.contains(r#""require_signed_binary": true"#),
+            "fixture not patched"
+        );
+        let path = write_policy("unenforced", &body);
+        std::env::set_var("BPFJAILER_POLICY", &path);
+        let err = load_policy().unwrap_err();
+        std::env::remove_var("BPFJAILER_POLICY");
+        assert!(
+            format!("{err:#}").contains("require_signed_binary"),
+            "got: {err:#}"
+        );
         let _ = fs::remove_file(path);
     }
 

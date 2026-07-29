@@ -156,3 +156,126 @@ mod tests {
         assert_ne!(policy_flags_to_u8(&f), policy_flags_to_u8(&none()));
     }
 }
+
+/// Bits the BPF programs actually test.
+///
+/// Kept as an explicit list so that a flag which is packed but never enforced
+/// cannot pass silently: see [`unenforced_flags`].
+pub const ENFORCED_FLAGS: u8 = FLAG_ALLOW_FILE_ACCESS
+    | FLAG_ALLOW_NETWORK
+    | FLAG_ALLOW_EXEC
+    | FLAG_ALLOW_PTRACE
+    | FLAG_ALLOW_MODULE_LOAD
+    | FLAG_ALLOW_BPF_LOAD;
+
+/// Names of flags a role sets that the BPF side does not enforce.
+///
+/// `require_signed_binary` and `allow_setuid` are accepted by the policy
+/// schema and written into `role_flags`, but `main.bpf.c` never tests those
+/// bits. A policy asking for them therefore gets no enforcement. Callers use
+/// this to refuse such a policy rather than apply it and look protected.
+///
+/// Only restrictive intent is reported: `allow_setuid: true` grants something
+/// that is unrestricted anyway, so it is not misleading. `allow_setuid: false`
+/// asks for a restriction that will not happen, and is.
+pub fn unenforced_flags(flags: &PolicyFlags) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if flags.require_signed_binary {
+        out.push("require_signed_binary");
+    }
+    if !flags.allow_setuid {
+        out.push("allow_setuid=false");
+    }
+    out
+}
+
+#[cfg(test)]
+mod unenforced_tests {
+    use super::*;
+
+    fn permissive() -> PolicyFlags {
+        PolicyFlags {
+            allow_file_access: true,
+            allow_network: true,
+            allow_exec: true,
+            require_signed_binary: false,
+            allow_setuid: true,
+            allow_ptrace: true,
+            allow_module_load: true,
+            allow_bpf_load: true,
+            require_proxy: false,
+        }
+    }
+
+    #[test]
+    fn enforced_set_matches_the_bits_bpf_tests() {
+        // main.bpf.c tests 0x01, 0x02, 0x04, 0x20, 0x40, 0x80.
+        assert_eq!(ENFORCED_FLAGS, 0x01 | 0x02 | 0x04 | 0x20 | 0x40 | 0x80);
+        assert_eq!(
+            ENFORCED_FLAGS & FLAG_REQUIRE_SIGNED_BINARY,
+            0,
+            "require_signed_binary is not enforced"
+        );
+        assert_eq!(
+            ENFORCED_FLAGS & FLAG_ALLOW_SETUID,
+            0,
+            "allow_setuid is not enforced"
+        );
+    }
+
+    #[test]
+    fn a_fully_enforced_policy_reports_nothing() {
+        assert!(unenforced_flags(&permissive()).is_empty());
+    }
+
+    #[test]
+    fn require_signed_binary_is_reported() {
+        let mut f = permissive();
+        f.require_signed_binary = true;
+        assert_eq!(unenforced_flags(&f), vec!["require_signed_binary"]);
+    }
+
+    #[test]
+    fn denying_setuid_is_reported_because_it_will_not_happen() {
+        let mut f = permissive();
+        f.allow_setuid = false;
+        assert_eq!(unenforced_flags(&f), vec!["allow_setuid=false"]);
+    }
+
+    #[test]
+    fn granting_setuid_is_not_reported() {
+        // allow_setuid: true asks for nothing to be restricted, which is what
+        // happens anyway -- not misleading.
+        let mut f = permissive();
+        f.allow_setuid = true;
+        assert!(unenforced_flags(&f).is_empty());
+    }
+
+    #[test]
+    fn several_unenforced_flags_are_all_reported() {
+        let mut f = permissive();
+        f.require_signed_binary = true;
+        f.allow_setuid = false;
+        assert_eq!(
+            unenforced_flags(&f),
+            vec!["require_signed_binary", "allow_setuid=false"]
+        );
+    }
+
+    #[test]
+    fn every_enforced_bit_is_reachable_from_policy_flags() {
+        // If a bit is in ENFORCED_FLAGS, some field must be able to set it.
+        let all = PolicyFlags {
+            allow_file_access: true,
+            allow_network: true,
+            allow_exec: true,
+            require_signed_binary: true,
+            allow_setuid: true,
+            allow_ptrace: true,
+            allow_module_load: true,
+            allow_bpf_load: true,
+            require_proxy: true,
+        };
+        assert_eq!(policy_flags_to_u8(&all) & ENFORCED_FLAGS, ENFORCED_FLAGS);
+    }
+}

@@ -168,6 +168,7 @@ dependencies = [
  "bpfjailer-common",
  "env_logger",
  "libbpf-rs",
+ "libc",
  "log",
  "ring",
  "serde_json",

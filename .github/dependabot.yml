@@ -9,3 +9,12 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "daily"
+    # Group patch/minor bumps so they land as one reviewable PR.
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+    # Major bumps of the BPF loader change the API surface and need a manual
+    # migration, so they should not be raised automatically.
+    ignore:
+      - dependency-name: "libbpf-rs"
+        update-types: ["version-update:semver-major"]

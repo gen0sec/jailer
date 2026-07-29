@@ -1,5 +1,5 @@
 use anyhow::Result;
-use bpfjailer_common::{PolicyConfig, PolicyFlags, PodId, Role, RoleId};
+use bpfjailer_common::{PodId, PolicyConfig, PolicyFlags, Role, RoleId};
 use log::info;
 use std::collections::HashMap;
 use std::path::Path;
@@ -65,17 +65,18 @@ impl PolicyManager {
             proxy: None,
         };
 
-        config.roles.insert("restricted".to_string(), restricted_role.clone());
-        config.roles.insert("permissive".to_string(), permissive_role.clone());
+        config
+            .roles
+            .insert("restricted".to_string(), restricted_role.clone());
+        config
+            .roles
+            .insert("permissive".to_string(), permissive_role.clone());
         role_map.insert(RoleId(1), Arc::new(restricted_role));
         role_map.insert(RoleId(2), Arc::new(permissive_role));
 
         info!("Initialized with default roles: restricted (1), permissive (2)");
 
-        Ok(Self {
-            config,
-            role_map,
-        })
+        Ok(Self { config, role_map })
     }
 
     pub async fn load_from_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
@@ -98,9 +99,9 @@ impl PolicyManager {
 
     #[allow(dead_code)]
     pub fn get_role_by_name(&self, name: &str) -> Option<&Arc<Role>> {
-        self.config.get_role(name).map(|r| {
-            self.role_map.get(&r.id).unwrap()
-        })
+        self.config
+            .get_role(name)
+            .map(|r| self.role_map.get(&r.id).unwrap())
     }
 
     pub fn config(&self) -> &PolicyConfig {
@@ -109,9 +110,12 @@ impl PolicyManager {
 
     /// Get executable enrollments from policy
     pub fn get_exec_enrollments(&self) -> Vec<(String, PodId, RoleId)> {
-        self.config.exec_enrollments.iter()
+        self.config
+            .exec_enrollments
+            .iter()
             .filter_map(|e| {
-                self.config.get_role(&e.role)
+                self.config
+                    .get_role(&e.role)
                     .map(|r| (e.executable_path.clone(), PodId(e.pod_id), r.id))
             })
             .collect()
@@ -119,9 +123,12 @@ impl PolicyManager {
 
     /// Get cgroup enrollments from policy
     pub fn get_cgroup_enrollments(&self) -> Vec<(String, PodId, RoleId)> {
-        self.config.cgroup_enrollments.iter()
+        self.config
+            .cgroup_enrollments
+            .iter()
             .filter_map(|e| {
-                self.config.get_role(&e.role)
+                self.config
+                    .get_role(&e.role)
                     .map(|r| (e.cgroup_path.clone(), PodId(e.pod_id), r.id))
             })
             .collect()

@@ -1,8 +1,10 @@
+use crate::bpf_loader::BpfJailerBpf;
 use anyhow::{Context, Result};
-use bpfjailer_common::{DomainRule, IpRule, NetworkRule, PathPattern, PodId, PolicyFlags, ProxyConfig, RoleId};
+use bpfjailer_common::{
+    DomainRule, IpRule, NetworkRule, PathPattern, PodId, PolicyFlags, ProxyConfig, RoleId,
+};
 use log::{debug, info, warn};
 use std::sync::Arc;
-use crate::bpf_loader::BpfJailerBpf;
 
 // Protocol constants
 pub const PROTO_TCP: u8 = 6;
@@ -40,18 +42,26 @@ impl ProcessTracker {
     }
 
     pub fn enroll_process(&self, pid: u32, pod_id: PodId, role_id: RoleId) -> Result<()> {
-        info!("Enrolling process {} into pod {} with role {}", pid, pod_id.0, role_id.0);
+        info!(
+            "Enrolling process {} into pod {} with role {}",
+            pid, pod_id.0, role_id.0
+        );
 
         // Update pod_to_role mapping
-        self.bpf.update_pod_role(pod_id.0, role_id.0)
+        self.bpf
+            .update_pod_role(pod_id.0, role_id.0)
             .context("Failed to insert pod_to_role mapping")?;
 
         // Add to pending_enrollments map - BPF will migrate to task_storage
         // on the next syscall (file_open, exec, etc.)
-        self.bpf.enroll_pending_process(pid, pod_id.0, role_id.0)
+        self.bpf
+            .enroll_pending_process(pid, pod_id.0, role_id.0)
             .context("Failed to add pending enrollment")?;
 
-        info!("Process {} enrolled successfully (pending migration to task_storage)", pid);
+        info!(
+            "Process {} enrolled successfully (pending migration to task_storage)",
+            pid
+        );
         Ok(())
     }
 
@@ -64,7 +74,8 @@ impl ProcessTracker {
 
     #[allow(dead_code)]
     pub fn update_role_flags(&self, role_id: RoleId, flags: u8) -> Result<()> {
-        self.bpf.update_role_flags(role_id.0, flags)
+        self.bpf
+            .update_role_flags(role_id.0, flags)
             .context("Failed to update role flags")?;
         Ok(())
     }
@@ -72,15 +83,24 @@ impl ProcessTracker {
     pub fn set_role_policy(&self, role_id: RoleId, flags: &PolicyFlags) -> Result<()> {
         let flags_u8 = policy_flags_to_u8(flags);
         info!("Setting role {} flags to 0x{:02x}", role_id.0, flags_u8);
-        self.bpf.update_role_flags(role_id.0, flags_u8)
+        self.bpf
+            .update_role_flags(role_id.0, flags_u8)
             .context("Failed to set role policy flags")?;
         Ok(())
     }
 
     /// Add a network rule for a role
     /// port: 0 = all ports
-    pub fn add_network_rule(&self, role_id: RoleId, port: u16, protocol: u8, direction: u8, allowed: bool) -> Result<()> {
-        self.bpf.add_network_rule(role_id.0, port, protocol, direction, allowed)
+    pub fn add_network_rule(
+        &self,
+        role_id: RoleId,
+        port: u16,
+        protocol: u8,
+        direction: u8,
+        allowed: bool,
+    ) -> Result<()> {
+        self.bpf
+            .add_network_rule(role_id.0, port, protocol, direction, allowed)
             .context("Failed to add network rule")
     }
 
@@ -97,7 +117,8 @@ impl ProcessTracker {
             };
 
             // Handle port range or single port
-            let ports: Vec<u16> = if let (Some(start), Some(end)) = (rule.port_start, rule.port_end) {
+            let ports: Vec<u16> = if let (Some(start), Some(end)) = (rule.port_start, rule.port_end)
+            {
                 // Port range specified
                 if start > end {
                     warn!("Invalid port range {}-{}, skipping", start, end);
@@ -105,8 +126,10 @@ impl ProcessTracker {
                 }
                 let range_size = (end - start + 1) as usize;
                 if range_size > 1000 {
-                    warn!("Port range {}-{} has {} ports (large ranges use many map entries)",
-                          start, end, range_size);
+                    warn!(
+                        "Port range {}-{} has {} ports (large ranges use many map entries)",
+                        start, end, range_size
+                    );
                 }
                 (start..=end).collect()
             } else if let Some(port) = rule.port {
@@ -130,8 +153,12 @@ impl ProcessTracker {
             } else {
                 info!(
                     "Applied network rule: role={} ports={}-{} ({} ports) proto={} allow={}",
-                    role_id.0, rule.port_start.unwrap(), rule.port_end.unwrap(),
-                    ports.len(), rule.protocol, rule.allow
+                    role_id.0,
+                    rule.port_start.unwrap(),
+                    rule.port_end.unwrap(),
+                    ports.len(),
+                    rule.protocol,
+                    rule.allow
                 );
             }
         }
@@ -141,13 +168,15 @@ impl ProcessTracker {
     /// Add a path rule for a role (legacy hash-based)
     #[allow(dead_code)]
     pub fn add_path_rule(&self, role_id: RoleId, path: &str, allowed: bool) -> Result<()> {
-        self.bpf.add_path_rule(role_id.0, path, allowed)
+        self.bpf
+            .add_path_rule(role_id.0, path, allowed)
             .context("Failed to add path rule")
     }
 
     /// Add a path state (dentry-walking state machine)
     pub fn add_path_state(&self, role_id: RoleId, pattern: &str, allowed: bool) -> Result<()> {
-        self.bpf.add_path_state(role_id.0, pattern, allowed)
+        self.bpf
+            .add_path_state(role_id.0, pattern, allowed)
             .context("Failed to add path state")
     }
 
@@ -180,8 +209,15 @@ impl ProcessTracker {
     // =========================================================================
 
     /// Add an IP/CIDR rule for egress filtering
-    pub fn add_ip_rule(&self, role_id: RoleId, cidr: &str, direction: u8, allowed: bool) -> Result<()> {
-        self.bpf.add_ip_rule(role_id.0, cidr, direction, allowed)
+    pub fn add_ip_rule(
+        &self,
+        role_id: RoleId,
+        cidr: &str,
+        direction: u8,
+        allowed: bool,
+    ) -> Result<()> {
+        self.bpf
+            .add_ip_rule(role_id.0, cidr, direction, allowed)
             .context("Failed to add IP rule")
     }
 
@@ -191,7 +227,7 @@ impl ProcessTracker {
             let direction = match rule.direction.to_lowercase().as_str() {
                 "bind" => DIR_BIND,
                 "connect" => DIR_CONNECT,
-                _ => DIR_CONNECT,  // Default to connect for egress control
+                _ => DIR_CONNECT, // Default to connect for egress control
             };
 
             self.add_ip_rule(role_id, &rule.cidr, direction, rule.allow)?;
@@ -206,13 +242,15 @@ impl ProcessTracker {
 
     /// Configure proxy requirement for a role
     pub fn set_proxy_config(&self, role_id: RoleId, config: &ProxyConfig) -> Result<()> {
-        self.bpf.set_proxy_config(role_id.0, &config.address, config.required)
+        self.bpf
+            .set_proxy_config(role_id.0, &config.address, config.required)
             .context("Failed to set proxy config")
     }
 
     /// Add a domain rule for egress filtering
     pub fn add_domain_rule(&self, role_id: RoleId, domain: &str, allowed: bool) -> Result<()> {
-        self.bpf.add_domain_rule(role_id.0, domain, allowed)
+        self.bpf
+            .add_domain_rule(role_id.0, domain, allowed)
             .context("Failed to add domain rule")
     }
 

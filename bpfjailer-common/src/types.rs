@@ -30,4 +30,3 @@ pub struct PolicyFlags {
     #[serde(default)]
     pub require_proxy: bool,
 }
-

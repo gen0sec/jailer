@@ -358,3 +358,159 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
     log::info!("All BPF objects pinned successfully");
     Ok(())
 }
+
+/// Root-gated tests for the daemonless bootstrap.
+///
+/// `load_bpf_object` and `pin_all` also *attach* the LSM programs, which needs
+/// `bpf` in the kernel's active LSM list; they are exercised on an LSM-enabled
+/// host rather than here. `populate_maps` only needs the maps to exist, so it
+/// is driven against an object that is loaded but never attached.
+#[cfg(test)]
+mod root_integration {
+    use super::*;
+
+    fn bpf_object_path() -> Option<std::path::PathBuf> {
+        let root = std::env::var("CARGO_MANIFEST_DIR")
+            .ok()
+            .map(PathBuf::from)?
+            .parent()?
+            .to_path_buf();
+        let p = root.join("bpfjailer-bpf/target/bpfel-unknown-none/release/bpfjailer.bpf.o");
+        p.exists().then_some(p)
+    }
+
+    /// Load (but do not attach) the BPF object, so the maps exist.
+    fn loaded_object() -> Option<Object> {
+        let path = bpf_object_path()?;
+        let mut builder = libbpf_rs::ObjectBuilder::default();
+        builder.open_file(path).ok()?.load().ok()
+    }
+
+    fn write_policy(tag: &str, body: &str) -> std::path::PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("bpfjailer-boot-{tag}-{}.json", std::process::id()));
+        fs::write(&p, body).expect("write policy");
+        p
+    }
+
+    const POLICY: &str = r#"{
+      "roles": {
+        "web": { "id": 30, "name": "web",
+          "flags": {"allow_file_access": true, "allow_network": true, "allow_exec": true,
+                    "require_signed_binary": false, "allow_setuid": true, "allow_ptrace": false,
+                    "allow_module_load": true, "allow_bpf_load": true},
+          "file_paths": [{"pattern": "/var/www/", "allow": true},
+                         {"pattern": "/etc/shadow", "allow": false}],
+          "network_rules": [{"protocol": "tcp", "port": 443, "allow": true}],
+          "execution_rules": [], "require_signed_binary": false }
+      },
+      "pods": [{"id": 300, "role_id": 30, "stack_depth": 0}],
+      "exec_enrollments": [],
+      "cgroup_enrollments": []
+    }"#;
+
+    #[test]
+    #[ignore = "requires root"]
+    fn is_pinned_reflects_the_pin_directory() {
+        // Whatever the current state, the answer must match the filesystem.
+        assert_eq!(is_pinned(), Path::new(BPF_PIN_PATH).exists());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn load_policy_honours_the_env_override() {
+        let path = write_policy("env", POLICY);
+        std::env::set_var("BPFJAILER_POLICY", &path);
+        let cfg = load_policy().expect("load");
+        std::env::remove_var("BPFJAILER_POLICY");
+        assert!(cfg.get_role("web").is_some());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn load_policy_surfaces_malformed_json() {
+        let path = write_policy("bad", "{ not json");
+        std::env::set_var("BPFJAILER_POLICY", &path);
+        let err = load_policy().unwrap_err();
+        std::env::remove_var("BPFJAILER_POLICY");
+        assert!(format!("{err:#}").contains("parse"), "got: {err:#}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn load_policy_surfaces_a_missing_file() {
+        std::env::set_var("BPFJAILER_POLICY", "/nonexistent/policy.json");
+        let err = load_policy().unwrap_err();
+        std::env::remove_var("BPFJAILER_POLICY");
+        assert!(format!("{err:#}").contains("read"), "got: {err:#}");
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn populate_maps_writes_roles_flags_and_path_states() {
+        let Some(mut object) = loaded_object() else {
+            eprintln!("skipping: BPF object not built or no permission");
+            return;
+        };
+        let cfg: PolicyConfig = serde_json::from_str(POLICY).expect("parse policy");
+        populate_maps(&mut object, &cfg).expect("populate");
+
+        // role_flags: every bit must survive, not just the first three.
+        let flags = object
+            .map("role_flags")
+            .expect("map")
+            .lookup(&30u32.to_ne_bytes(), MapFlags::empty())
+            .expect("lookup")
+            .expect("role present");
+        let expected =
+            bpfjailer_common::flags::policy_flags_to_u8(&cfg.get_role("web").unwrap().flags);
+        assert_eq!(flags[0], expected);
+
+        // path_states: the deny rule must be present under the codec's key.
+        let entries = bpfjailer_common::codec::path_state_entries(30, "/etc/shadow", false);
+        let map = object.map("path_states").expect("map");
+        for (key, value) in entries {
+            let got = map
+                .lookup(&key, MapFlags::empty())
+                .expect("lookup")
+                .expect("transition present");
+            assert_eq!(got.as_slice(), value.as_slice());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn populate_maps_writes_pod_to_role() {
+        let Some(mut object) = loaded_object() else {
+            return;
+        };
+        let cfg: PolicyConfig = serde_json::from_str(POLICY).expect("parse");
+        populate_maps(&mut object, &cfg).expect("populate");
+        let v = object
+            .map("pod_to_role")
+            .expect("map")
+            .lookup(&300u64.to_ne_bytes(), MapFlags::empty())
+            .expect("lookup")
+            .expect("pod present");
+        assert_eq!(u32::from_ne_bytes(v[0..4].try_into().unwrap()), 30);
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn add_path_state_matches_the_shared_codec() {
+        let Some(object) = loaded_object() else {
+            return;
+        };
+        let map = object.map("path_states").expect("map");
+        add_path_state(map, 31, "/srv/data/", false).expect("add");
+        for (key, value) in bpfjailer_common::codec::path_state_entries(31, "/srv/data/", false) {
+            let got = map
+                .lookup(&key, MapFlags::empty())
+                .expect("lookup")
+                .expect("present");
+            assert_eq!(got.as_slice(), value.as_slice());
+        }
+    }
+}

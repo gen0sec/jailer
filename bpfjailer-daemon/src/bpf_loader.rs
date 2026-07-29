@@ -191,6 +191,15 @@ impl BpfJailerBpf {
         })
     }
 
+    /// Raw map read, for tests that need to assert what was actually written.
+    /// Not part of the runtime API -- the daemon only ever writes.
+    #[cfg(test)]
+    pub(crate) fn map_lookup(&self, map_name: &str, key: &[u8]) -> Option<Vec<u8>> {
+        let object = self.object.lock().unwrap();
+        let map = object.map(map_name)?;
+        map.lookup(key, MapFlags::empty()).ok().flatten()
+    }
+
     pub fn update_pod_role(&self, pod_id: u64, role_id: u32) -> Result<()> {
         let object = self.object.lock().unwrap();
         let map = object
@@ -507,47 +516,8 @@ impl BpfJailerBpf {
             .map("ip_rules")
             .ok_or_else(|| anyhow::anyhow!("ip_rules map not found"))?;
 
-        // Parse CIDR notation
-        let (ip_str, prefix_len) = if let Some(slash_pos) = cidr.find('/') {
-            let (ip, prefix) = cidr.split_at(slash_pos);
-            let prefix_len: u8 = prefix[1..]
-                .parse()
-                .map_err(|_| anyhow::anyhow!("Invalid prefix length in CIDR: {}", cidr))?;
-            (ip, prefix_len)
-        } else {
-            (cidr, 32u8) // Single IP = /32
-        };
-
-        // Parse IP address
-        let ip_addr: std::net::Ipv4Addr = ip_str
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid IPv4 address: {}", ip_str))?;
-        let ip_bytes = ip_addr.octets();
-
-        // Create mask and apply in network byte order
-        // The IP in sin_addr.s_addr is stored in network byte order (big endian)
-        // When read into a u32 on little-endian, it stays as raw bytes
-        let mask = if prefix_len < 32 && prefix_len > 0 {
-            !0u32 << (32 - prefix_len)
-        } else if prefix_len == 0 {
-            0u32
-        } else {
-            !0u32
-        };
-
-        // Apply mask in host byte order then convert to network byte order for storage
-        let ip_native = u32::from_be_bytes(ip_bytes);
-        let masked_native = ip_native & mask;
-        // Store as raw bytes (network byte order) - same format as sin_addr.s_addr
-        let masked_bytes = masked_native.to_be_bytes();
-
-        // struct ip_rule_key { u32 role_id; u32 ip_addr; u8 prefix_len; u8 direction; u8 _pad[2]; }
-        let mut key = [0u8; 12];
-        key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        // Store IP in network byte order (raw bytes) to match what BPF reads from sin_addr
-        key[4..8].copy_from_slice(&masked_bytes);
-        key[8] = prefix_len;
-        key[9] = direction;
+        let (ip, prefix_len) = codec::parse_cidr(cidr).map_err(|e| anyhow::anyhow!(e))?;
+        let key = codec::ip_rule_key(role_id, ip, prefix_len, direction);
 
         let value = [if allowed { 1u8 } else { 0u8 }];
         map.update(&key, &value, MapFlags::empty())?;
@@ -557,15 +527,16 @@ impl BpfJailerBpf {
         log::info!(
             "IP rule: role={} {} {} -> {}",
             role_id,
-            cidr,
             dir_name,
+            cidr,
             action
         );
-
         Ok(())
     }
 
-    /// Remove an IP/CIDR rule
+    // No production caller yet -- rule removal is not wired into the
+    // enrollment API. Exercised by the root integration tests, which is
+    // how the add/remove byte-order mismatch was found.
     #[allow(dead_code)]
     pub fn remove_ip_rule(&self, role_id: u32, cidr: &str, direction: u8) -> Result<()> {
         let object = self.object.lock().unwrap();
@@ -573,81 +544,35 @@ impl BpfJailerBpf {
             .map("ip_rules")
             .ok_or_else(|| anyhow::anyhow!("ip_rules map not found"))?;
 
-        let (ip_str, prefix_len) = if let Some(slash_pos) = cidr.find('/') {
-            let (ip, prefix) = cidr.split_at(slash_pos);
-            let prefix_len: u8 = prefix[1..].parse()?;
-            (ip, prefix_len)
-        } else {
-            (cidr, 32u8)
-        };
-
-        let ip_addr: std::net::Ipv4Addr = ip_str.parse()?;
-        let ip_bytes = ip_addr.octets();
-        let ip_u32 = u32::from_be_bytes(ip_bytes);
-
-        let masked_ip = if prefix_len < 32 {
-            let mask = !0u32 << (32 - prefix_len);
-            u32::from_be_bytes((u32::from_be_bytes(ip_bytes) & mask).to_be_bytes())
-        } else {
-            ip_u32
-        };
-
-        let mut key = [0u8; 12];
-        key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        key[4..8].copy_from_slice(&masked_ip.to_ne_bytes());
-        key[8] = prefix_len;
-        key[9] = direction;
+        // Must use the same encoder as add_ip_rule: these previously disagreed
+        // on byte order, so removal never matched the stored key.
+        let (ip, prefix_len) = codec::parse_cidr(cidr).map_err(|e| anyhow::anyhow!(e))?;
+        let key = codec::ip_rule_key(role_id, ip, prefix_len, direction);
 
         map.delete(&key)?;
         log::info!("Removed IP rule: role={} {}", role_id, cidr);
         Ok(())
     }
 
-    /// Configure proxy requirement for a role
-    /// proxy_addr: "host:port" format (e.g., "127.0.0.1:8080")
-    /// required: if true, all connections must go through the proxy
     pub fn set_proxy_config(&self, role_id: u32, proxy_addr: &str, required: bool) -> Result<()> {
         let object = self.object.lock().unwrap();
         let map = object
             .map("proxy_config")
             .ok_or_else(|| anyhow::anyhow!("proxy_config map not found"))?;
 
-        // Parse proxy address
-        let parts: Vec<&str> = proxy_addr.split(':').collect();
-        if parts.len() != 2 {
-            return Err(anyhow::anyhow!(
-                "Invalid proxy address format: {}",
-                proxy_addr
-            ));
-        }
-
-        let proxy_ip: std::net::Ipv4Addr = parts[0]
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid proxy IP: {}", parts[0]))?;
-        let proxy_port: u16 = parts[1]
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid proxy port: {}", parts[1]))?;
-
-        let ip_bytes = proxy_ip.octets();
-        let ip_u32 = u32::from_be_bytes(ip_bytes);
-
+        let (ip, port) = codec::parse_proxy_addr(proxy_addr).map_err(|e| anyhow::anyhow!(e))?;
         let key = role_id.to_ne_bytes();
-
-        // struct proxy_config { u32 proxy_ip; u16 proxy_port; u8 require_proxy; u8 _pad; }
-        let mut value = [0u8; 8];
-        value[0..4].copy_from_slice(&ip_u32.to_ne_bytes());
-        value[4..6].copy_from_slice(&proxy_port.to_ne_bytes());
-        value[6] = if required { 1 } else { 0 };
-
+        let value = codec::proxy_config_value(ip, port, required);
         map.update(&key, &value, MapFlags::empty())?;
 
         let mode = if required { "REQUIRED" } else { "OPTIONAL" };
         log::info!("Proxy config: role={} {} -> {}", role_id, proxy_addr, mode);
-
         Ok(())
     }
 
-    /// Remove proxy configuration for a role
+    // No production caller yet -- rule removal is not wired into the
+    // enrollment API. Exercised by the root integration tests, which is
+    // how the add/remove byte-order mismatch was found.
     #[allow(dead_code)]
     pub fn remove_proxy_config(&self, role_id: u32) -> Result<()> {
         let object = self.object.lock().unwrap();
@@ -832,5 +757,269 @@ impl BpfJailerBpf {
 
         log::info!("Pinned BPF objects removed (programs still active until reboot)");
         Ok(())
+    }
+}
+
+/// Integration tests that load the real BPF object and round-trip every map
+/// write through the kernel.
+///
+/// These need `CAP_BPF`/root and a kernel with BTF, so they are `#[ignore]`d by
+/// default. They do **not** require `bpf` in the active LSM list: the programs
+/// are loaded (which creates the maps) but never attached, so the map contract
+/// between userspace and BPF is exercised without needing an LSM-enabled
+/// kernel.
+///
+///     sudo -E cargo test -p bpfjailer-daemon --  --include-ignored --test-threads=1
+///
+/// Single-threaded: each test loads its own BPF object, and running many at
+/// once trips the memlock limit on smaller machines.
+#[cfg(test)]
+mod root_integration {
+    use super::*;
+    use bpfjailer_common::codec;
+
+    /// Skip rather than fail when not run as root, so the default
+    /// `cargo test` run stays green for contributors without privileges.
+    fn bpf() -> Option<BpfJailerBpf> {
+        match BpfJailerBpf::load() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("skipping: could not load BPF object ({e})");
+                None
+            }
+        }
+    }
+
+    macro_rules! bpf_or_skip {
+        () => {
+            match bpf() {
+                Some(b) => b,
+                None => return,
+            }
+        };
+    }
+
+    fn lookup(b: &BpfJailerBpf, map_name: &str, key: &[u8]) -> Option<Vec<u8>> {
+        b.map_lookup(map_name, key)
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn loads_and_creates_every_map_the_loader_requires() {
+        let b = bpf_or_skip!();
+        let object = b.object.lock().unwrap();
+        for name in [
+            "pod_to_role",
+            "role_flags",
+            "pending_enrollments",
+            "network_rules",
+            "path_rules",
+            "path_states",
+            "inode_cache",
+            "exec_enrollment",
+            "cgroup_enrollment",
+            "ip_rules",
+            "proxy_config",
+            "domain_rules",
+            "task_storage",
+        ] {
+            assert!(object.map(name).is_some(), "map {name} missing");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn pod_role_round_trips() {
+        let b = bpf_or_skip!();
+        b.update_pod_role(4242, 7).expect("update");
+        let v = lookup(&b, "pod_to_role", &4242u64.to_ne_bytes()).expect("entry present");
+        assert_eq!(u32::from_ne_bytes(v[0..4].try_into().unwrap()), 7);
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn role_flags_round_trip_the_exact_byte() {
+        let b = bpf_or_skip!();
+        b.update_role_flags(9, 0b1010_0101).expect("update");
+        let v = lookup(&b, "role_flags", &9u32.to_ne_bytes()).expect("entry present");
+        assert_eq!(v[0], 0b1010_0101);
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn network_rule_lands_on_the_key_the_codec_computes() {
+        let b = bpf_or_skip!();
+        b.add_network_rule(3, 443, codec::PROTO_TCP, 1, true)
+            .expect("add");
+        let key = codec::net_rule_key(3, 443, codec::PROTO_TCP, 1);
+        assert_eq!(
+            lookup(&b, "network_rules", &key).map(|v| v[0]),
+            Some(1),
+            "userspace and codec must agree on the key"
+        );
+
+        b.remove_network_rule(3, 443, codec::PROTO_TCP, 1)
+            .expect("remove");
+        assert!(lookup(&b, "network_rules", &key).is_none(), "entry removed");
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn path_rule_round_trips_and_removes() {
+        let b = bpf_or_skip!();
+        b.add_path_rule(1, "/etc/shadow", false).expect("add");
+        let key = codec::path_rule_key(1, "/etc/shadow");
+        assert_eq!(lookup(&b, "path_rules", &key).map(|v| v[0]), Some(0));
+        b.remove_path_rule(1, "/etc/shadow").expect("remove");
+        assert!(lookup(&b, "path_rules", &key).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn path_state_writes_one_entry_per_component() {
+        let b = bpf_or_skip!();
+        b.add_path_state(5, "/etc/ssh/sshd_config", false)
+            .expect("add");
+        for (key, expected) in codec::path_state_entries(5, "/etc/ssh/sshd_config", false) {
+            let got = lookup(&b, "path_states", &key).expect("transition present");
+            assert_eq!(
+                got.as_slice(),
+                expected.as_slice(),
+                "value bytes must match"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn path_state_wildcards_are_stored_under_hash_zero() {
+        let b = bpf_or_skip!();
+        b.add_path_state(6, "/home/*/.ssh", false).expect("add");
+        let entries = codec::path_state_entries(6, "/home/*/.ssh", false);
+        let wildcard = &entries[1];
+        assert!(lookup(&b, "path_states", &wildcard.0).is_some());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn directory_pattern_adds_the_trailing_wildcard_transition() {
+        let b = bpf_or_skip!();
+        b.add_path_state(8, "/var/secrets/", false).expect("add");
+        let entries = codec::path_state_entries(8, "/var/secrets/", false);
+        let last = entries.last().expect("at least one entry");
+        let got = lookup(&b, "path_states", &last.0).expect("wildcard terminal present");
+        assert_eq!(got[10], 1, "wildcard flag set in the stored value");
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn exec_enrollment_round_trips_and_removes() {
+        let b = bpf_or_skip!();
+        b.add_exec_enrollment(987_654, 11, 3).expect("add");
+        let v = lookup(&b, "exec_enrollment", &987_654u64.to_ne_bytes()).expect("present");
+        assert_eq!(v.as_slice(), codec::enrollment_value(11, 3).as_slice());
+        b.remove_exec_enrollment(987_654).expect("remove");
+        assert!(lookup(&b, "exec_enrollment", &987_654u64.to_ne_bytes()).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn cgroup_enrollment_round_trips_and_removes() {
+        let b = bpf_or_skip!();
+        b.add_cgroup_enrollment(555, 12, 4).expect("add");
+        assert!(lookup(&b, "cgroup_enrollment", &555u64.to_ne_bytes()).is_some());
+        b.remove_cgroup_enrollment(555).expect("remove");
+        assert!(lookup(&b, "cgroup_enrollment", &555u64.to_ne_bytes()).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn ip_rule_is_stored_under_the_masked_network_address() {
+        let b = bpf_or_skip!();
+        b.add_ip_rule(2, "10.1.2.3/8", 1, false).expect("add");
+        // The host bits must have been cleared, so the /8 network key hits.
+        let key = codec::ip_rule_key(2, "10.0.0.0".parse().unwrap(), 8, 1);
+        assert_eq!(lookup(&b, "ip_rules", &key).map(|v| v[0]), Some(0));
+        b.remove_ip_rule(2, "10.1.2.3/8", 1).expect("remove");
+        assert!(lookup(&b, "ip_rules", &key).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn bare_ip_rule_is_treated_as_a_slash_32() {
+        let b = bpf_or_skip!();
+        b.add_ip_rule(2, "192.168.5.9", 0, true).expect("add");
+        let key = codec::ip_rule_key(2, "192.168.5.9".parse().unwrap(), 32, 0);
+        assert_eq!(lookup(&b, "ip_rules", &key).map(|v| v[0]), Some(1));
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn malformed_cidr_is_rejected_rather_than_stored() {
+        let b = bpf_or_skip!();
+        assert!(b.add_ip_rule(2, "not-an-ip", 1, true).is_err());
+        assert!(b.add_ip_rule(2, "10.0.0.0/99", 1, true).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn proxy_config_round_trips_and_removes() {
+        let b = bpf_or_skip!();
+        b.set_proxy_config(6, "127.0.0.1:3128", true).expect("set");
+        let v = lookup(&b, "proxy_config", &6u32.to_ne_bytes()).expect("present");
+        let expected = codec::proxy_config_value("127.0.0.1".parse().unwrap(), 3128, true);
+        assert_eq!(v.as_slice(), expected.as_slice());
+        b.remove_proxy_config(6).expect("remove");
+        assert!(lookup(&b, "proxy_config", &6u32.to_ne_bytes()).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn malformed_proxy_address_is_rejected() {
+        let b = bpf_or_skip!();
+        assert!(b.set_proxy_config(6, "127.0.0.1", true).is_err());
+        assert!(b.set_proxy_config(6, "127.0.0.1:notaport", true).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn domain_rule_round_trips_and_removes() {
+        let b = bpf_or_skip!();
+        b.add_domain_rule(4, "api.example.com", true).expect("add");
+        let key = codec::domain_rule_key(4, "api.example.com");
+        assert_eq!(lookup(&b, "domain_rules", &key).map(|v| v[0]), Some(1));
+        b.remove_domain_rule(4, "api.example.com").expect("remove");
+        assert!(lookup(&b, "domain_rules", &key).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn pending_enrollment_round_trips() {
+        let b = bpf_or_skip!();
+        b.enroll_pending_process(4321, 77, 5).expect("enroll");
+        let v = lookup(&b, "pending_enrollments", &4321u32.to_ne_bytes()).expect("present");
+        assert_eq!(u64::from_ne_bytes(v[0..8].try_into().unwrap()), 77);
+        assert_eq!(u32::from_ne_bytes(v[8..12].try_into().unwrap()), 5);
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn invalidate_cache_succeeds() {
+        let b = bpf_or_skip!();
+        b.invalidate_cache().expect("invalidate");
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn get_file_inode_matches_stat() {
+        use std::os::unix::fs::MetadataExt;
+        let expected = std::fs::metadata("/bin/sh").expect("stat /bin/sh").ino();
+        assert_eq!(BpfJailerBpf::get_file_inode("/bin/sh").unwrap(), expected);
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn get_file_inode_surfaces_a_missing_path() {
+        assert!(BpfJailerBpf::get_file_inode("/nonexistent/binary").is_err());
     }
 }

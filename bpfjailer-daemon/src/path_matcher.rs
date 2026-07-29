@@ -107,3 +107,23 @@ mod tests {
         assert!(validate_patterns(&pats(&["/var/**"])).is_ok());
     }
 }
+
+/// Root-gated tests for the parts that need a loaded BPF object.
+#[cfg(test)]
+mod root_integration {
+    use super::*;
+    use crate::bpf_loader::BpfJailerBpf;
+
+    #[test]
+    #[ignore = "requires root"]
+    fn new_and_invalidate_cache_work_against_a_loaded_object() {
+        let Ok(bpf) = BpfJailerBpf::load() else {
+            eprintln!("skipping: needs root and a BPF-capable kernel");
+            return;
+        };
+        let pm = PathMatcher::new(Arc::new(bpf)).expect("construct");
+        pm.compile_patterns(&["/etc/ssh/".to_string()])
+            .expect("compile");
+        pm.invalidate_cache().expect("invalidate");
+    }
+}

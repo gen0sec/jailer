@@ -263,3 +263,201 @@ impl EnrollmentServer {
         Ok(())
     }
 }
+
+/// Root-gated integration tests: they bind the real enrollment socket and
+/// drive it with the real client. See `bpf_loader::root_integration`.
+#[cfg(test)]
+mod root_integration {
+    use super::*;
+    use bpfjailer_client::EnrollmentClient;
+    use bpfjailer_common::{PodId, RoleId};
+    use tokio::io::AsyncReadExt;
+
+    /// Bring up a server on the real socket path and hand back a client.
+    /// Returns None when the environment cannot support it (no root / no BPF).
+    async fn server() -> Option<EnrollmentClient> {
+        let bpf = Arc::new(crate::bpf_loader::BpfJailerBpf::load().ok()?);
+        let tracker = Arc::new(ProcessTracker::new(bpf.clone()).ok()?);
+        let pm = Arc::new(RwLock::new(PolicyManager::new().ok()?));
+        let alt = Arc::new(AlternativeEnrollment::new(bpf, tracker.clone(), pm.clone()));
+        let srv = EnrollmentServer::new(tracker, pm, alt);
+
+        // Clear any socket left by an earlier test: its presence would
+        // otherwise look like readiness while nothing is listening.
+        let _ = std::fs::remove_file(SOCKET_PATH);
+
+        tokio::spawn(async move {
+            let _ = srv.run().await;
+        });
+
+        // Readiness is "a connect succeeds", not "the file exists" -- a stale
+        // socket file yields ECONNREFUSED.
+        for _ in 0..200 {
+            if AsyncUnixStream::connect(SOCKET_PATH).await.is_ok() {
+                return Some(EnrollmentClient::new(SOCKET_PATH));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    macro_rules! client_or_skip {
+        () => {
+            match server().await {
+                Some(c) => c,
+                None => {
+                    eprintln!("skipping: needs root and a BPF-capable kernel");
+                    return;
+                }
+            }
+        };
+    }
+
+    /// Send a request the typed client has no helper for.
+    async fn raw(req: &EnrollmentRequest) -> EnrollmentResponse {
+        let mut s = AsyncUnixStream::connect(SOCKET_PATH)
+            .await
+            .expect("connect");
+        let mut json = serde_json::to_vec(req).expect("encode");
+        json.push(b'\n');
+        s.write_all(&json).await.expect("write");
+        s.flush().await.expect("flush");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.expect("read");
+        serde_json::from_slice(&buf).expect("decode response")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn enroll_over_the_socket_succeeds() {
+        let c = client_or_skip!();
+        c.enroll(PodId(910), RoleId(2)).await.expect("enroll");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn query_reports_not_enrolled_while_get_process_info_is_a_stub() {
+        let c = client_or_skip!();
+        // get_process_info always returns None today, so Query answers with an
+        // error rather than ProcessInfo. Pinned so a real implementation has
+        // to update this deliberately.
+        assert!(c.query(std::process::id()).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn executable_enrollment_over_the_socket_round_trips() {
+        let _c = client_or_skip!();
+        let exe = std::env::temp_dir().join(format!("bpfjailer-sock-{}", std::process::id()));
+        std::fs::copy("/bin/sh", &exe).expect("copy");
+        let path = exe.to_str().unwrap().to_string();
+
+        let r = raw(&EnrollmentRequest::EnrollExecutable {
+            executable_path: path.clone(),
+            pod_id: PodId(920),
+            role_id: RoleId(2),
+        })
+        .await;
+        assert!(matches!(r, EnrollmentResponse::Success), "got {r:?}");
+
+        let r = raw(&EnrollmentRequest::RemoveExecutable {
+            executable_path: path.clone(),
+        })
+        .await;
+        assert!(matches!(r, EnrollmentResponse::Success), "got {r:?}");
+        let _ = std::fs::remove_file(&exe);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn xattr_requests_round_trip_over_the_socket() {
+        let _c = client_or_skip!();
+        let exe = std::env::temp_dir().join(format!("bpfjailer-sockx-{}", std::process::id()));
+        std::fs::copy("/bin/sh", &exe).expect("copy");
+        let path = exe.to_str().unwrap().to_string();
+
+        assert!(matches!(
+            raw(&EnrollmentRequest::SetXattr {
+                executable_path: path.clone(),
+                pod_id: PodId(931),
+                role_id: RoleId(2),
+            })
+            .await,
+            EnrollmentResponse::Success
+        ));
+
+        match raw(&EnrollmentRequest::CheckXattr {
+            executable_path: path.clone(),
+        })
+        .await
+        {
+            EnrollmentResponse::XattrInfo { pod_id, role_id } => {
+                assert_eq!((pod_id, role_id), (PodId(931), RoleId(2)));
+            }
+            other => panic!("expected XattrInfo, got {other:?}"),
+        }
+
+        assert!(matches!(
+            raw(&EnrollmentRequest::RemoveXattr {
+                executable_path: path.clone()
+            })
+            .await,
+            EnrollmentResponse::Success
+        ));
+        let _ = std::fs::remove_file(&exe);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn a_failing_request_returns_an_error_response_not_a_dropped_connection() {
+        let _c = client_or_skip!();
+        let r = raw(&EnrollmentRequest::EnrollExecutable {
+            executable_path: "/nonexistent/binary".into(),
+            pod_id: PodId(1),
+            role_id: RoleId(1),
+        })
+        .await;
+        assert!(matches!(r, EnrollmentResponse::Error(_)), "got {r:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn cgroup_requests_are_answered() {
+        let _c = client_or_skip!();
+        let r = raw(&EnrollmentRequest::EnrollCgroup {
+            cgroup_path: "/sys/fs/cgroup/definitely-not-here".into(),
+            pod_id: PodId(1),
+            role_id: RoleId(1),
+        })
+        .await;
+        assert!(matches!(r, EnrollmentResponse::Error(_)), "got {r:?}");
+
+        let r = raw(&EnrollmentRequest::RemoveCgroup {
+            cgroup_path: "/sys/fs/cgroup/definitely-not-here".into(),
+        })
+        .await;
+        // Removal of an absent entry may succeed or report an error; it must
+        // answer either way rather than hanging.
+        assert!(matches!(
+            r,
+            EnrollmentResponse::Success | EnrollmentResponse::Error(_)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn malformed_json_does_not_take_the_server_down() {
+        let c = client_or_skip!();
+        {
+            let mut s = AsyncUnixStream::connect(SOCKET_PATH)
+                .await
+                .expect("connect");
+            s.write_all(b"{ not json\n").await.expect("write");
+            s.flush().await.expect("flush");
+        }
+        // The server must still serve the next client.
+        c.enroll(PodId(940), RoleId(2))
+            .await
+            .expect("still serving");
+    }
+}

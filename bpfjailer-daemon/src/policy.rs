@@ -82,7 +82,23 @@ impl PolicyManager {
     pub async fn load_from_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         info!("Loading policy from {:?}", path.as_ref());
         let content = fs::read_to_string(path).await?;
-        self.config = serde_json::from_str(&content)?;
+        let config: PolicyConfig = serde_json::from_str(&content)?;
+
+        // Refuse a policy that asks for something the BPF side does not
+        // enforce. Loading it would leave the operator believing a restriction
+        // is in force when nothing implements it -- worse than rejecting it.
+        for (name, role) in &config.roles {
+            let unenforced = bpfjailer_common::flags::unenforced_flags(&role.flags);
+            if !unenforced.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "role '{}' requests {} which this build does not enforce; \
+                     remove the setting or do not rely on it",
+                    name,
+                    unenforced.join(", ")
+                ));
+            }
+        }
+        self.config = config;
 
         self.role_map.clear();
         for role in self.config.roles.values() {
@@ -143,12 +159,12 @@ mod tests {
       "roles": {
         "web": { "id": 10, "name": "web",
           "flags": {"allow_file_access": true, "allow_network": true, "allow_exec": true,
-                    "require_signed_binary": false, "allow_setuid": false, "allow_ptrace": false},
+                    "require_signed_binary": false, "allow_setuid": true, "allow_ptrace": false},
           "file_paths": [], "network_rules": [], "execution_rules": [],
           "require_signed_binary": false },
         "db": { "id": 11, "name": "db",
           "flags": {"allow_file_access": true, "allow_network": false, "allow_exec": false,
-                    "require_signed_binary": false, "allow_setuid": false, "allow_ptrace": false},
+                    "require_signed_binary": false, "allow_setuid": true, "allow_ptrace": false},
           "file_paths": [], "network_rules": [], "execution_rules": [],
           "require_signed_binary": false }
       },
@@ -253,6 +269,90 @@ mod tests {
     async fn load_from_file_surfaces_missing_file() {
         let mut pm = PolicyManager::new().unwrap();
         assert!(pm.load_from_file("/nonexistent/policy.json").await.is_err());
+    }
+
+    /// A policy asking for a flag the BPF side never tests must be refused.
+    /// Applying it would leave the operator believing a restriction is in
+    /// force when nothing enforces it.
+    const UNENFORCED_POLICY: &str = r#"{
+      "roles": {
+        "signed": { "id": 40, "name": "signed",
+          "flags": {"allow_file_access": true, "allow_network": true, "allow_exec": true,
+                    "require_signed_binary": true, "allow_setuid": true, "allow_ptrace": false},
+          "file_paths": [], "network_rules": [], "execution_rules": [],
+          "require_signed_binary": true }
+      },
+      "pods": []
+    }"#;
+
+    #[tokio::test]
+    async fn policy_requesting_an_unenforced_flag_is_refused() {
+        let path = temp_policy("unenforced", UNENFORCED_POLICY);
+        let mut pm = PolicyManager::new().unwrap();
+        let err = pm
+            .load_from_file(&path)
+            .await
+            .expect_err("must refuse a policy with unenforced flags");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("require_signed_binary"), "got: {msg}");
+        assert!(
+            msg.contains("signed"),
+            "message should name the role: {msg}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Denying setuid is equally unenforced and must also be refused.
+    #[tokio::test]
+    async fn policy_denying_setuid_is_refused() {
+        let body = UNENFORCED_POLICY
+            .replace(
+                r#""require_signed_binary": true, "allow_setuid": true"#,
+                r#""require_signed_binary": false, "allow_setuid": false"#,
+            )
+            .replace(
+                r#""require_signed_binary": true }"#,
+                r#""require_signed_binary": false }"#,
+            );
+        assert!(
+            body.contains(r#""allow_setuid": false"#),
+            "fixture not patched"
+        );
+        let path = temp_policy("nosetuid", &body);
+        let mut pm = PolicyManager::new().unwrap();
+        let err = pm.load_from_file(&path).await.expect_err("must refuse");
+        assert!(format!("{err:#}").contains("allow_setuid"), "got: {err:#}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A refused policy must not partially apply: the previous roles stay.
+    #[tokio::test]
+    async fn a_refused_policy_leaves_the_previous_config_intact() {
+        let path = temp_policy("refused", UNENFORCED_POLICY);
+        let mut pm = PolicyManager::new().unwrap();
+        let _ = pm.load_from_file(&path).await;
+        assert!(
+            pm.get_role(RoleId(1)).is_some(),
+            "builtin roles must survive a rejected load"
+        );
+        assert!(
+            pm.get_role(RoleId(40)).is_none(),
+            "rejected role must not be applied"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn policy_using_only_enforced_flags_loads() {
+        let body = SAMPLE.replace(r#""allow_setuid": false"#, r#""allow_setuid": true"#);
+        assert!(
+            body.contains(r#""allow_setuid": true"#),
+            "fixture not patched"
+        );
+        let path = temp_policy("enforced-only", &body);
+        let mut pm = PolicyManager::new().unwrap();
+        pm.load_from_file(&path).await.expect("should load");
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

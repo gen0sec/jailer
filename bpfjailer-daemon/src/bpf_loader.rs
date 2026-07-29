@@ -200,6 +200,39 @@ impl BpfJailerBpf {
         map.lookup(key, MapFlags::empty()).ok().flatten()
     }
 
+    /// Read a task's `process_info` out of the `task_storage` map.
+    ///
+    /// Task-local storage is keyed by a *pidfd* when read from userspace, not
+    /// by a pid, which is why an earlier version of `get_process_info` gave up
+    /// and returned `None` unconditionally.
+    ///
+    /// Returns `Ok(None)` when the process is gone or has no entry yet -- the
+    /// BPF side only populates storage once the task hits a hooked syscall.
+    pub fn lookup_task_storage(&self, pid: u32) -> Result<Option<Vec<u8>>> {
+        // SAFETY: pidfd_open takes a pid and flags and returns a new fd or -1.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0i32) };
+        if raw < 0 {
+            // No such process, or no permission to open it.
+            return Ok(None);
+        }
+        let fd = raw as i32;
+
+        let result = {
+            let object = self.object.lock().unwrap();
+            match object.map("task_storage") {
+                Some(map) => map
+                    .lookup(&fd.to_ne_bytes(), MapFlags::empty())
+                    .ok()
+                    .flatten(),
+                None => None,
+            }
+        };
+
+        // SAFETY: fd was just created by pidfd_open and is not used again.
+        unsafe { libc::close(fd) };
+        Ok(result)
+    }
+
     pub fn update_pod_role(&self, pod_id: u64, role_id: u32) -> Result<()> {
         let object = self.object.lock().unwrap();
         let map = object

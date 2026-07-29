@@ -6,9 +6,8 @@ use bpfjailer_common::{
 use log::{debug, info, warn};
 use std::sync::Arc;
 
-// Protocol constants
-pub const PROTO_TCP: u8 = 6;
-pub const PROTO_UDP: u8 = 17;
+// Protocol numbers now live in bpfjailer_common::codec, alongside the map
+// encoders, so userspace and BPF cannot drift.
 
 // Direction constants
 pub const DIR_BIND: u8 = 0;
@@ -91,37 +90,14 @@ impl ProcessTracker {
     /// Apply network rules from a Role definition
     pub fn apply_network_rules(&self, role_id: RoleId, rules: &[NetworkRule]) -> Result<()> {
         for rule in rules {
-            let protocol = match rule.protocol.to_lowercase().as_str() {
-                "tcp" => PROTO_TCP,
-                "udp" => PROTO_UDP,
-                other => {
-                    warn!("Unknown protocol '{}', skipping rule", other);
-                    continue;
-                }
-            };
-
-            // Handle port range or single port
-            let ports: Vec<u16> = if let (Some(start), Some(end)) = (rule.port_start, rule.port_end)
-            {
-                // Port range specified
-                if start > end {
-                    warn!("Invalid port range {}-{}, skipping", start, end);
-                    continue;
-                }
-                let range_size = (end - start + 1) as usize;
-                if range_size > 1000 {
-                    warn!(
-                        "Port range {}-{} has {} ports (large ranges use many map entries)",
-                        start, end, range_size
-                    );
-                }
-                (start..=end).collect()
-            } else if let Some(port) = rule.port {
-                // Single port
-                vec![port]
-            } else {
-                // Wildcard (all ports)
-                vec![0]
+            let Some((protocol, ports)) = bpfjailer_common::codec::expand_network_rule(
+                &rule.protocol,
+                rule.port,
+                rule.port_start,
+                rule.port_end,
+            ) else {
+                warn!("Skipping unusable network rule: {:?}", rule);
+                continue;
             };
 
             for port in &ports {

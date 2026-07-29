@@ -134,3 +134,141 @@ impl PolicyManager {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"{
+      "roles": {
+        "web": { "id": 10, "name": "web",
+          "flags": {"allow_file_access": true, "allow_network": true, "allow_exec": true,
+                    "require_signed_binary": false, "allow_setuid": false, "allow_ptrace": false},
+          "file_paths": [], "network_rules": [], "execution_rules": [],
+          "require_signed_binary": false },
+        "db": { "id": 11, "name": "db",
+          "flags": {"allow_file_access": true, "allow_network": false, "allow_exec": false,
+                    "require_signed_binary": false, "allow_setuid": false, "allow_ptrace": false},
+          "file_paths": [], "network_rules": [], "execution_rules": [],
+          "require_signed_binary": false }
+      },
+      "pods": [],
+      "exec_enrollments": [
+        {"executable_path": "/usr/bin/nginx", "pod_id": 100, "role": "web"},
+        {"executable_path": "/usr/bin/ghost", "pod_id": 101, "role": "does-not-exist"}
+      ],
+      "cgroup_enrollments": [
+        {"cgroup_path": "/sys/fs/cgroup/db", "pod_id": 200, "role": "db"}
+      ]
+    }"#;
+
+    fn temp_policy(name: &str, body: &str) -> std::path::PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("bpfjailer-test-{name}-{}.json", std::process::id()));
+        std::fs::write(&p, body).expect("write temp policy");
+        p
+    }
+
+    #[test]
+    fn new_seeds_the_builtin_roles() {
+        let pm = PolicyManager::new().expect("new");
+        let restricted = pm.get_role(RoleId(1)).expect("role 1");
+        let permissive = pm.get_role(RoleId(2)).expect("role 2");
+        assert_eq!(restricted.name, "restricted");
+        assert_eq!(permissive.name, "permissive");
+    }
+
+    #[test]
+    fn builtin_restricted_denies_everything() {
+        let pm = PolicyManager::new().unwrap();
+        let f = &pm.get_role(RoleId(1)).unwrap().flags;
+        assert!(!f.allow_file_access && !f.allow_network && !f.allow_exec);
+    }
+
+    #[test]
+    fn builtin_permissive_allows_the_core_three() {
+        let pm = PolicyManager::new().unwrap();
+        let f = &pm.get_role(RoleId(2)).unwrap().flags;
+        assert!(f.allow_file_access && f.allow_network && f.allow_exec);
+    }
+
+    #[test]
+    fn unknown_role_id_is_none() {
+        let pm = PolicyManager::new().unwrap();
+        assert!(pm.get_role(RoleId(9999)).is_none());
+    }
+
+    #[tokio::test]
+    async fn load_from_file_replaces_the_builtin_roles() {
+        let path = temp_policy("replace", SAMPLE);
+        let mut pm = PolicyManager::new().unwrap();
+        pm.load_from_file(&path).await.expect("load");
+        assert!(pm.get_role(RoleId(10)).is_some(), "loaded role present");
+        assert!(
+            pm.get_role(RoleId(1)).is_none(),
+            "builtin roles must be cleared, not merged"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn get_role_by_name_resolves_loaded_roles() {
+        let path = temp_policy("byname", SAMPLE);
+        let mut pm = PolicyManager::new().unwrap();
+        pm.load_from_file(&path).await.unwrap();
+        assert_eq!(pm.get_role_by_name("web").unwrap().id, RoleId(10));
+        assert!(pm.get_role_by_name("nope").is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn enrollments_referencing_unknown_roles_are_dropped() {
+        let path = temp_policy("drop", SAMPLE);
+        let mut pm = PolicyManager::new().unwrap();
+        pm.load_from_file(&path).await.unwrap();
+
+        let execs = pm.get_exec_enrollments();
+        assert_eq!(execs.len(), 1, "the ghost-role enrollment must be dropped");
+        assert_eq!(execs[0].0, "/usr/bin/nginx");
+        assert_eq!(execs[0].1, PodId(100));
+        assert_eq!(execs[0].2, RoleId(10));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn cgroup_enrollments_resolve_role_ids() {
+        let path = temp_policy("cgroup", SAMPLE);
+        let mut pm = PolicyManager::new().unwrap();
+        pm.load_from_file(&path).await.unwrap();
+        let cg = pm.get_cgroup_enrollments();
+        assert_eq!(cg.len(), 1);
+        assert_eq!(
+            cg[0],
+            ("/sys/fs/cgroup/db".to_string(), PodId(200), RoleId(11))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn load_from_file_surfaces_missing_file() {
+        let mut pm = PolicyManager::new().unwrap();
+        assert!(pm.load_from_file("/nonexistent/policy.json").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_from_file_surfaces_malformed_json() {
+        let path = temp_policy("bad", "{ not json");
+        let mut pm = PolicyManager::new().unwrap();
+        assert!(pm.load_from_file(&path).await.is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn config_exposes_the_loaded_document() {
+        let path = temp_policy("config", SAMPLE);
+        let mut pm = PolicyManager::new().unwrap();
+        pm.load_from_file(&path).await.unwrap();
+        assert_eq!(pm.config().roles.len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+}

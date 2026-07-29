@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bpfjailer_common::codec;
 use libbpf_rs::{MapFlags, Object, ObjectBuilder};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -257,12 +258,7 @@ impl BpfJailerBpf {
             .map("network_rules")
             .ok_or_else(|| anyhow::anyhow!("network_rules map not found"))?;
 
-        // struct net_rule_key { u32 role_id; u16 port; u8 protocol; u8 direction; }
-        let mut key = [0u8; 8];
-        key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        key[4..6].copy_from_slice(&port.to_ne_bytes());
-        key[6] = protocol;
-        key[7] = direction;
+        let key = codec::net_rule_key(role_id, port, protocol, direction);
 
         let value = [if allowed { 1u8 } else { 0u8 }];
         map.update(&key, &value, MapFlags::empty())?;
@@ -319,23 +315,16 @@ impl BpfJailerBpf {
             .map("path_rules")
             .ok_or_else(|| anyhow::anyhow!("path_rules map not found"))?;
 
-        let path_hash = bpfjailer_common::hash::fnv1a_hash_u64(path);
-
-        // struct path_rule_key { u32 role_id; u64 path_hash; }
-        let mut key = [0u8; 16]; // 4 + 4 padding + 8 = 16 bytes
-        key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        // padding bytes 4-7 are zero
-        key[8..16].copy_from_slice(&path_hash.to_ne_bytes());
+        let key = codec::path_rule_key(role_id, path);
 
         let value = [if allowed { 1u8 } else { 0u8 }];
         map.update(&key, &value, MapFlags::empty())?;
 
         let action = if allowed { "ALLOW" } else { "DENY" };
         log::info!(
-            "Path rule: role={} path=\"{}\" (hash={:#x}) -> {}",
+            "Path rule: role={} path=\"{}\" -> {}",
             role_id,
             path,
-            path_hash,
             action
         );
 
@@ -372,108 +361,24 @@ impl BpfJailerBpf {
             .map("path_states")
             .ok_or_else(|| anyhow::anyhow!("path_states map not found"))?;
 
-        // Parse path into components
-        let components: Vec<&str> = pattern
-            .split('/')
-            .filter(|s| !s.is_empty() && *s != "**")
-            .collect();
-
-        if components.is_empty() {
+        let entries = codec::path_state_entries(role_id, pattern, allowed);
+        if entries.is_empty() {
             return Ok(());
         }
-
-        let mut state: u64 = 0; // Start from root state
-
-        for (i, component) in components.iter().enumerate() {
-            let is_last = i == components.len() - 1;
-            let is_wildcard = *component == "*";
-            let component_hash = if is_wildcard {
-                0
-            } else {
-                bpfjailer_common::hash::fnv1a_hash_u64(component)
-            };
-
-            // Create state transition
-            // struct path_state_key { u32 role_id; u32 state; u32 component_hash; }
-            let mut key = [0u8; 24];
-            key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-            key[8..16].copy_from_slice(&state.to_ne_bytes());
-            key[16..24].copy_from_slice(&component_hash.to_ne_bytes());
-
-            let next_state = if is_last {
-                if allowed {
-                    0xFFFF_FFFF_FFFF_FFFE_u64
-                } else {
-                    0xFFFF_FFFF_FFFF_FFFF_u64
-                } // ACCEPT or REJECT
-            } else {
-                // Generate unique state ID based on path so far
-                bpfjailer_common::hash::fnv1a_hash_u64(&format!(
-                    "{}:{}",
-                    role_id,
-                    components[..=i].join("/")
-                ))
-            };
-
-            // struct path_state_value { u32 next_state; u8 is_terminal; u8 decision; u8 wildcard; u8 _pad; }
-            let mut value = [0u8; 16];
-            value[0..8].copy_from_slice(&next_state.to_ne_bytes());
-            value[8] = if is_last { 1 } else { 0 }; // is_terminal
-            value[9] = if allowed { 1 } else { 0 }; // decision
-            value[10] = if is_wildcard { 1 } else { 0 }; // wildcard
-            value[11] = 0; // padding
-
-            map.update(&key, &value, MapFlags::empty())?;
-
-            state = next_state;
+        for (key, value) in &entries {
+            map.update(key, value, MapFlags::empty())?;
         }
 
-        // If pattern ends with "/" (directory), add terminal state for any file under it
-        if pattern.ends_with('/') {
-            // Add wildcard transition for any component after this directory
-            let mut key = [0u8; 24];
-            key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-            key[8..16].copy_from_slice(&state.to_ne_bytes());
-            key[16..24].copy_from_slice(&0u64.to_ne_bytes()); // wildcard (0 = any)
-
-            let terminal_state: u64 = if allowed {
-                0xFFFF_FFFF_FFFF_FFFE
-            } else {
-                0xFFFF_FFFF_FFFF_FFFF
-            };
-            let mut value = [0u8; 16];
-            value[0..8].copy_from_slice(&terminal_state.to_ne_bytes());
-            value[8] = 1; // is_terminal
-            value[9] = if allowed { 1 } else { 0 };
-            value[10] = 1; // wildcard
-            value[11] = 0;
-
-            map.update(&key, &value, MapFlags::empty())?;
-        }
-
-        let action = if allowed { "ALLOW" } else { "DENY" };
         log::info!(
-            "Path state: role={} pattern=\"{}\" -> {} ({} components)",
+            "Added path state machine: role={} pattern={} -> {} ({} transitions)",
             role_id,
             pattern,
-            action,
-            components.len()
+            if allowed { "ALLOW" } else { "DENY" },
+            entries.len()
         );
-
-        // Debug: show component hashes
-        for (i, comp) in components.iter().enumerate() {
-            let h = if *comp == "*" {
-                0
-            } else {
-                bpfjailer_common::hash::fnv1a_hash_u64(comp)
-            };
-            log::debug!("  Component {}: \"{}\" -> hash={:#x}", i, comp, h);
-        }
-
         Ok(())
     }
 
-    /// Increment cache generation counter to invalidate inode cache
     pub fn invalidate_cache(&self) -> Result<()> {
         let object = self.object.lock().unwrap();
         let map = object
@@ -765,24 +670,13 @@ impl BpfJailerBpf {
             .map("domain_rules")
             .ok_or_else(|| anyhow::anyhow!("domain_rules map not found"))?;
 
-        let domain_hash = bpfjailer_common::hash::fnv1a_hash_u64(domain);
-
-        // struct domain_rule_key { u32 role_id; u64 domain_hash; }  (4B padding)
-        let mut key = [0u8; 16];
-        key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        key[8..16].copy_from_slice(&domain_hash.to_ne_bytes());
+        let key = codec::domain_rule_key(role_id, domain);
 
         let value = [if allowed { 1u8 } else { 0u8 }];
         map.update(&key, &value, MapFlags::empty())?;
 
         let action = if allowed { "ALLOW" } else { "DENY" };
-        log::info!(
-            "Domain rule: role={} {} (hash={:#x}) -> {}",
-            role_id,
-            domain,
-            domain_hash,
-            action
-        );
+        log::info!("Domain rule: role={} {} -> {}", role_id, domain, action);
 
         Ok(())
     }

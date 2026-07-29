@@ -319,7 +319,7 @@ impl BpfJailerBpf {
             .map("path_rules")
             .ok_or_else(|| anyhow::anyhow!("path_rules map not found"))?;
 
-        let path_hash = djb2_hash(path);
+        let path_hash = bpfjailer_common::hash::fnv1a_hash_u64(path);
 
         // struct path_rule_key { u32 role_id; u64 path_hash; }
         let mut key = [0u8; 16]; // 4 + 4 padding + 8 = 16 bytes
@@ -350,7 +350,7 @@ impl BpfJailerBpf {
             .map("path_rules")
             .ok_or_else(|| anyhow::anyhow!("path_rules map not found"))?;
 
-        let path_hash = djb2_hash(path);
+        let path_hash = bpfjailer_common::hash::fnv1a_hash_u64(path);
 
         let mut key = [0u8; 16];
         key[0..4].copy_from_slice(&role_id.to_ne_bytes());
@@ -382,7 +382,7 @@ impl BpfJailerBpf {
             return Ok(());
         }
 
-        let mut state: u32 = 0; // Start from root state
+        let mut state: u64 = 0; // Start from root state
 
         for (i, component) in components.iter().enumerate() {
             let is_last = i == components.len() - 1;
@@ -390,34 +390,38 @@ impl BpfJailerBpf {
             let component_hash = if is_wildcard {
                 0
             } else {
-                djb2_hash_u32(component)
+                bpfjailer_common::hash::fnv1a_hash_u64(component)
             };
 
             // Create state transition
             // struct path_state_key { u32 role_id; u32 state; u32 component_hash; }
-            let mut key = [0u8; 12];
+            let mut key = [0u8; 24];
             key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-            key[4..8].copy_from_slice(&state.to_ne_bytes());
-            key[8..12].copy_from_slice(&component_hash.to_ne_bytes());
+            key[8..16].copy_from_slice(&state.to_ne_bytes());
+            key[16..24].copy_from_slice(&component_hash.to_ne_bytes());
 
             let next_state = if is_last {
                 if allowed {
-                    0xFFFFFFFE
+                    0xFFFF_FFFF_FFFF_FFFE_u64
                 } else {
-                    0xFFFFFFFF
+                    0xFFFF_FFFF_FFFF_FFFF_u64
                 } // ACCEPT or REJECT
             } else {
                 // Generate unique state ID based on path so far
-                djb2_hash_u32(&format!("{}:{}", role_id, components[..=i].join("/")))
+                bpfjailer_common::hash::fnv1a_hash_u64(&format!(
+                    "{}:{}",
+                    role_id,
+                    components[..=i].join("/")
+                ))
             };
 
             // struct path_state_value { u32 next_state; u8 is_terminal; u8 decision; u8 wildcard; u8 _pad; }
-            let mut value = [0u8; 8];
-            value[0..4].copy_from_slice(&next_state.to_ne_bytes());
-            value[4] = if is_last { 1 } else { 0 }; // is_terminal
-            value[5] = if allowed { 1 } else { 0 }; // decision
-            value[6] = if is_wildcard { 1 } else { 0 }; // wildcard
-            value[7] = 0; // padding
+            let mut value = [0u8; 16];
+            value[0..8].copy_from_slice(&next_state.to_ne_bytes());
+            value[8] = if is_last { 1 } else { 0 }; // is_terminal
+            value[9] = if allowed { 1 } else { 0 }; // decision
+            value[10] = if is_wildcard { 1 } else { 0 }; // wildcard
+            value[11] = 0; // padding
 
             map.update(&key, &value, MapFlags::empty())?;
 
@@ -427,18 +431,22 @@ impl BpfJailerBpf {
         // If pattern ends with "/" (directory), add terminal state for any file under it
         if pattern.ends_with('/') {
             // Add wildcard transition for any component after this directory
-            let mut key = [0u8; 12];
+            let mut key = [0u8; 24];
             key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-            key[4..8].copy_from_slice(&state.to_ne_bytes());
-            key[8..12].copy_from_slice(&0u32.to_ne_bytes()); // wildcard (0 = any)
+            key[8..16].copy_from_slice(&state.to_ne_bytes());
+            key[16..24].copy_from_slice(&0u64.to_ne_bytes()); // wildcard (0 = any)
 
-            let terminal_state: u32 = if allowed { 0xFFFFFFFE } else { 0xFFFFFFFF };
-            let mut value = [0u8; 8];
-            value[0..4].copy_from_slice(&terminal_state.to_ne_bytes());
-            value[4] = 1; // is_terminal
-            value[5] = if allowed { 1 } else { 0 };
-            value[6] = 1; // wildcard
-            value[7] = 0;
+            let terminal_state: u64 = if allowed {
+                0xFFFF_FFFF_FFFF_FFFE
+            } else {
+                0xFFFF_FFFF_FFFF_FFFF
+            };
+            let mut value = [0u8; 16];
+            value[0..8].copy_from_slice(&terminal_state.to_ne_bytes());
+            value[8] = 1; // is_terminal
+            value[9] = if allowed { 1 } else { 0 };
+            value[10] = 1; // wildcard
+            value[11] = 0;
 
             map.update(&key, &value, MapFlags::empty())?;
         }
@@ -454,7 +462,11 @@ impl BpfJailerBpf {
 
         // Debug: show component hashes
         for (i, comp) in components.iter().enumerate() {
-            let h = if *comp == "*" { 0 } else { djb2_hash_u32(comp) };
+            let h = if *comp == "*" {
+                0
+            } else {
+                bpfjailer_common::hash::fnv1a_hash_u64(comp)
+            };
             log::debug!("  Component {}: \"{}\" -> hash={:#x}", i, comp, h);
         }
 
@@ -753,12 +765,12 @@ impl BpfJailerBpf {
             .map("domain_rules")
             .ok_or_else(|| anyhow::anyhow!("domain_rules map not found"))?;
 
-        let domain_hash = djb2_hash_u32(domain);
+        let domain_hash = bpfjailer_common::hash::fnv1a_hash_u64(domain);
 
-        // struct domain_rule_key { u32 role_id; u32 domain_hash; }
-        let mut key = [0u8; 8];
+        // struct domain_rule_key { u32 role_id; u64 domain_hash; }  (4B padding)
+        let mut key = [0u8; 16];
         key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        key[4..8].copy_from_slice(&domain_hash.to_ne_bytes());
+        key[8..16].copy_from_slice(&domain_hash.to_ne_bytes());
 
         let value = [if allowed { 1u8 } else { 0u8 }];
         map.update(&key, &value, MapFlags::empty())?;
@@ -783,11 +795,11 @@ impl BpfJailerBpf {
             .map("domain_rules")
             .ok_or_else(|| anyhow::anyhow!("domain_rules map not found"))?;
 
-        let domain_hash = djb2_hash_u32(domain);
+        let domain_hash = bpfjailer_common::hash::fnv1a_hash_u64(domain);
 
-        let mut key = [0u8; 8];
+        let mut key = [0u8; 16];
         key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        key[4..8].copy_from_slice(&domain_hash.to_ne_bytes());
+        key[8..16].copy_from_slice(&domain_hash.to_ne_bytes());
 
         map.delete(&key)?;
         log::info!("Removed domain rule: role={} {}", role_id, domain);
@@ -927,22 +939,4 @@ impl BpfJailerBpf {
         log::info!("Pinned BPF objects removed (programs still active until reboot)");
         Ok(())
     }
-}
-
-/// djb2 hash function (64-bit) - must match the BPF implementation exactly
-fn djb2_hash(s: &str) -> u64 {
-    let mut hash: u64 = 5381;
-    for c in s.bytes().take(64) {
-        hash = hash.wrapping_mul(33).wrapping_add(c as u64);
-    }
-    hash
-}
-
-/// djb2 hash function (32-bit) - for path component hashing
-fn djb2_hash_u32(s: &str) -> u32 {
-    let mut hash: u32 = 5381;
-    for c in s.bytes().take(32) {
-        hash = hash.wrapping_mul(33).wrapping_add(c as u32);
-    }
-    hash
 }

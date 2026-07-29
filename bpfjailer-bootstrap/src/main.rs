@@ -149,7 +149,7 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
     // Load roles and their flags
     for (name, role) in &policy.roles {
         let role_id = role.id.0;
-        let flags = flags_to_byte(&role.flags);
+        let flags = bpfjailer_common::flags::policy_flags_to_u8(&role.flags);
 
         // Update role_flags map
         if let Some(map) = object.map("role_flags") {
@@ -431,33 +431,4 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
 
     log::info!("All BPF objects pinned successfully");
     Ok(())
-}
-
-fn flags_to_byte(flags: &bpfjailer_common::types::PolicyFlags) -> u8 {
-    let mut byte: u8 = 0;
-    if flags.allow_file_access {
-        byte |= 0x01;
-    }
-    if flags.allow_network {
-        byte |= 0x02;
-    }
-    if flags.allow_exec {
-        byte |= 0x04;
-    }
-    if flags.require_signed_binary {
-        byte |= 0x08;
-    }
-    if flags.allow_setuid {
-        byte |= 0x10;
-    }
-    if flags.allow_ptrace {
-        byte |= 0x20;
-    }
-    if flags.allow_module_load {
-        byte |= 0x40;
-    }
-    if flags.allow_bpf_load {
-        byte |= 0x80;
-    }
-    byte
 }

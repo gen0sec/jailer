@@ -227,3 +227,166 @@ impl ProcessTracker {
         Ok(())
     }
 }
+
+/// Root-gated integration tests. See the note in `bpf_loader::root_integration`.
+#[cfg(test)]
+mod root_integration {
+    use super::*;
+    use bpfjailer_common::codec;
+    use bpfjailer_common::policy::{NetworkRule, PathPattern};
+
+    fn tracker() -> Option<ProcessTracker> {
+        let bpf = BpfJailerBpf::load().ok()?;
+        ProcessTracker::new(Arc::new(bpf)).ok()
+    }
+
+    macro_rules! tracker_or_skip {
+        () => {
+            match tracker() {
+                Some(t) => t,
+                None => {
+                    eprintln!("skipping: needs root and a BPF-capable kernel");
+                    return;
+                }
+            }
+        };
+    }
+
+    fn net_rule(proto: &str, port: Option<u16>, allow: bool) -> NetworkRule {
+        NetworkRule {
+            protocol: proto.into(),
+            address: None,
+            port,
+            port_start: None,
+            port_end: None,
+            allow,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn enroll_process_records_a_pending_enrollment() {
+        let t = tracker_or_skip!();
+        t.enroll_process(31337, PodId(88), RoleId(6))
+            .expect("enroll");
+        // Enrollment is staged in pending_enrollments; the BPF side migrates it
+        // into task_storage on the task's next hooked syscall.
+        let v = t
+            .bpf
+            .map_lookup("pending_enrollments", &31337u32.to_ne_bytes())
+            .expect("pending entry present");
+        assert_eq!(u64::from_ne_bytes(v[0..8].try_into().unwrap()), 88);
+        assert_eq!(u32::from_ne_bytes(v[8..12].try_into().unwrap()), 6);
+    }
+
+    /// `get_process_info` is a stub: task storage cannot be read from
+    /// userspace, so it returns `None` unconditionally. This pins that
+    /// behaviour so a future implementation has to update the test
+    /// deliberately -- today any caller sees every process as unenrolled.
+    #[test]
+    #[ignore = "requires root"]
+    fn get_process_info_is_currently_always_none() {
+        let t = tracker_or_skip!();
+        t.enroll_process(31338, PodId(89), RoleId(7))
+            .expect("enroll");
+        assert!(
+            t.get_process_info(31338).expect("query").is_none(),
+            "stub is documented to return None even for an enrolled pid"
+        );
+        assert!(t.get_process_info(4_000_001).expect("query").is_none());
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn set_role_policy_writes_every_flag_bit() {
+        let t = tracker_or_skip!();
+        let flags = PolicyFlags {
+            allow_file_access: true,
+            allow_network: true,
+            allow_exec: true,
+            require_signed_binary: true,
+            allow_setuid: true,
+            allow_ptrace: true,
+            allow_module_load: true,
+            allow_bpf_load: true,
+            require_proxy: false,
+        };
+        t.set_role_policy(RoleId(21), &flags).expect("set");
+        // Regression guard for the daemon dropping all but the first three bits.
+        assert_eq!(bpfjailer_common::flags::policy_flags_to_u8(&flags), 0xFF);
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn apply_network_rules_writes_both_directions() {
+        let t = tracker_or_skip!();
+        t.apply_network_rules(RoleId(22), &[net_rule("tcp", Some(8443), true)])
+            .expect("apply");
+        // bind (0) and connect (1) must both be present
+        for dir in [0u8, 1u8] {
+            let _ = codec::net_rule_key(22, 8443, codec::PROTO_TCP, dir);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn apply_network_rules_skips_unusable_rules_without_failing() {
+        let t = tracker_or_skip!();
+        let rules = vec![
+            net_rule("icmp", Some(0), true), // unknown protocol -> skipped
+            net_rule("tcp", Some(9090), true),
+        ];
+        t.apply_network_rules(RoleId(23), &rules)
+            .expect("a bad rule must not abort the batch");
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn apply_network_rules_expands_a_port_range() {
+        let t = tracker_or_skip!();
+        let rule = NetworkRule {
+            protocol: "udp".into(),
+            address: None,
+            port: None,
+            port_start: Some(5000),
+            port_end: Some(5004),
+            allow: false,
+        };
+        t.apply_network_rules(RoleId(24), &[rule]).expect("apply");
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn apply_path_rules_accepts_allow_and_deny_patterns() {
+        let t = tracker_or_skip!();
+        let rules = vec![
+            PathPattern {
+                pattern: "/etc/ssh/".into(),
+                allow: false,
+            },
+            PathPattern {
+                pattern: "/var/www/*".into(),
+                allow: true,
+            },
+        ];
+        t.apply_path_rules(RoleId(25), &rules).expect("apply");
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn add_path_state_and_path_rule_are_both_accepted() {
+        let t = tracker_or_skip!();
+        t.add_path_state(RoleId(26), "/srv/data/", false)
+            .expect("state");
+        t.add_path_rule(RoleId(26), "/srv/data/secret", false)
+            .expect("rule");
+    }
+
+    #[test]
+    #[ignore = "requires root"]
+    fn update_role_flags_accepts_a_raw_byte() {
+        let t = tracker_or_skip!();
+        t.update_role_flags(RoleId(27), 0b0000_0111)
+            .expect("update");
+    }
+}

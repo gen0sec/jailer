@@ -270,3 +270,141 @@ impl AlternativeEnrollment {
         Ok(())
     }
 }
+
+/// Root-gated integration tests. See `bpf_loader::root_integration`.
+#[cfg(test)]
+mod root_integration {
+    use super::*;
+
+    fn alt() -> Option<AlternativeEnrollment> {
+        let bpf = Arc::new(BpfJailerBpf::load().ok()?);
+        let tracker = Arc::new(ProcessTracker::new(bpf.clone()).ok()?);
+        let pm = Arc::new(RwLock::new(PolicyManager::new().ok()?));
+        Some(AlternativeEnrollment::new(bpf, tracker, pm))
+    }
+
+    macro_rules! alt_or_skip {
+        () => {
+            match alt() {
+                Some(a) => a,
+                None => {
+                    eprintln!("skipping: needs root and a BPF-capable kernel");
+                    return;
+                }
+            }
+        };
+    }
+
+    /// A real file to hang enrollments off, removed on drop.
+    struct TempExe(std::path::PathBuf);
+    impl TempExe {
+        fn new(tag: &str) -> Self {
+            let p =
+                std::env::temp_dir().join(format!("bpfjailer-alt-{tag}-{}", std::process::id()));
+            std::fs::copy("/bin/sh", &p).expect("copy /bin/sh");
+            Self(p)
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+    impl Drop for TempExe {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn executable_enrollment_is_keyed_on_the_files_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let a = alt_or_skip!();
+        let exe = TempExe::new("exec");
+        a.enroll_by_executable_path(exe.path(), PodId(501), RoleId(2))
+            .await
+            .expect("enroll");
+
+        let inode = std::fs::metadata(exe.path()).unwrap().ino();
+        let v = a
+            .bpf
+            .map_lookup("exec_enrollment", &inode.to_ne_bytes())
+            .expect("enrollment stored under the inode");
+        assert_eq!(u64::from_ne_bytes(v[0..8].try_into().unwrap()), 501);
+        assert_eq!(u32::from_ne_bytes(v[8..12].try_into().unwrap()), 2);
+
+        a.remove_executable_enrollment(exe.path())
+            .await
+            .expect("remove");
+        assert!(a
+            .bpf
+            .map_lookup("exec_enrollment", &inode.to_ne_bytes())
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn enrolling_a_missing_executable_is_an_error() {
+        let a = alt_or_skip!();
+        assert!(a
+            .enroll_by_executable_path("/nonexistent/binary", PodId(1), RoleId(1))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn xattr_enrollment_round_trips() {
+        let a = alt_or_skip!();
+        let exe = TempExe::new("xattr");
+        a.set_xattr_enrollment(exe.path(), PodId(77), RoleId(3))
+            .await
+            .expect("set xattr");
+
+        let got = a.check_xattr_enrollment(exe.path()).await.expect("check");
+        assert_eq!(got, Some((PodId(77), RoleId(3))));
+
+        a.remove_xattr_enrollment(exe.path()).await.expect("remove");
+        assert_eq!(
+            a.check_xattr_enrollment(exe.path()).await.expect("check"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn check_xattr_on_a_file_without_one_is_none() {
+        let a = alt_or_skip!();
+        let exe = TempExe::new("noxattr");
+        assert_eq!(
+            a.check_xattr_enrollment(exe.path()).await.expect("check"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn xattr_on_a_missing_path_is_an_error() {
+        let a = alt_or_skip!();
+        assert!(a
+            .set_xattr_enrollment("/nonexistent/binary", PodId(1), RoleId(1))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn cgroup_enrollment_rejects_a_missing_cgroup() {
+        let a = alt_or_skip!();
+        assert!(a
+            .enroll_by_cgroup_path("/sys/fs/cgroup/definitely-not-here", PodId(1), RoleId(1))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root"]
+    async fn load_from_policy_runs_against_the_default_policy() {
+        let a = alt_or_skip!();
+        a.load_from_policy().await.expect("load_from_policy");
+    }
+}

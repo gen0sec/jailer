@@ -104,3 +104,36 @@ jobs:
       # libbpf via FFI and load BPF objects, which miri cannot model.
       # bpfjailer-common is pure-Rust policy and type definitions.
       - run: cargo +nightly miri test -p bpfjailer-common --lib
+
+  root-integration:
+    name: Integration (root, real BPF)
+    needs: [fmt, clippy]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev libelf-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: root-integration
+      - name: Report kernel BPF capability
+        run: |
+          uname -r
+          test -f /sys/kernel/btf/vmlinux && echo "BTF: present" || echo "BTF: MISSING"
+          cat /sys/kernel/security/lsm 2>/dev/null || echo "lsm: securityfs not mounted"
+      - name: Build BPF programs
+        working-directory: bpfjailer-bpf
+        run: cargo build --release
+      # These load the real BPF object and round-trip every map through the
+      # kernel. They need root but not `bpf` in the active LSM list: the
+      # programs are loaded (creating the maps) and never attached.
+      # Serial: each test loads its own object and the enrollment tests share
+      # a fixed socket path.
+      - name: Root integration tests
+        run: |
+          sudo -E env "PATH=$PATH" cargo test --workspace --release \
+            -- --include-ignored --test-threads=1
+

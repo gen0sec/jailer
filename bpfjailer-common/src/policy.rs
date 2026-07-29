@@ -114,6 +114,12 @@ pub struct PolicyConfig {
     pub cgroup_enrollments: Vec<CgroupEnrollment>,
 }
 
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PolicyConfig {
     pub fn new() -> Self {
         Self {

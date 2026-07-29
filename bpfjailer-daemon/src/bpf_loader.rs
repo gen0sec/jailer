@@ -175,6 +175,10 @@ impl BpfJailerBpf {
         log::info!("All eBPF programs loaded and attached successfully");
 
         Ok(Self {
+            // libbpf_rs::Object is neither Send nor Sync; the Arc<Mutex<_>>
+            // is only shared within a single thread here. Worth revisiting if
+            // the loader ever becomes multi-threaded.
+            #[allow(clippy::arc_with_non_send_sync)]
             object: Arc::new(Mutex::new(object)),
         })
     }

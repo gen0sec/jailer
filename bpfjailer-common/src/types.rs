@@ -14,7 +14,7 @@ pub struct ProcessInfo {
     pub stack_depth: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PolicyFlags {
     pub allow_file_access: bool,
     pub allow_network: bool,
@@ -31,18 +31,3 @@ pub struct PolicyFlags {
     pub require_proxy: bool,
 }
 
-impl Default for PolicyFlags {
-    fn default() -> Self {
-        Self {
-            allow_file_access: false,
-            allow_network: false,
-            allow_exec: false,
-            require_signed_binary: false,
-            allow_setuid: false,
-            allow_ptrace: false,
-            allow_module_load: false,
-            allow_bpf_load: false,
-            require_proxy: false,
-        }
-    }
-}

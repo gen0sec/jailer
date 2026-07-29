@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
     // Apply IP rules, domain rules, and proxy config from policy
     {
         let pm = policy_manager.read().await;
-        for (_name, role) in pm.config().roles.iter() {
+        for role in pm.config().roles.values() {
             let role_id = role.id;
 
             // Apply IP rules

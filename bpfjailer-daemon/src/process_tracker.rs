@@ -18,23 +18,7 @@ pub struct ProcessTracker {
     bpf: Arc<BpfJailerBpf>,
 }
 
-// Convert PolicyFlags to u8 for BPF map
-// bit 0 (0x01) = allow_file_access
-// bit 1 (0x02) = allow_network
-// bit 2 (0x04) = allow_exec
-fn policy_flags_to_u8(flags: &PolicyFlags) -> u8 {
-    let mut result = 0u8;
-    if flags.allow_file_access {
-        result |= 0x01;
-    }
-    if flags.allow_network {
-        result |= 0x02;
-    }
-    if flags.allow_exec {
-        result |= 0x04;
-    }
-    result
-}
+use bpfjailer_common::flags::policy_flags_to_u8;
 
 impl ProcessTracker {
     pub fn new(bpf: Arc<BpfJailerBpf>) -> Result<Self> {

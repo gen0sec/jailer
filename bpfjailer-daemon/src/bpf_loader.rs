@@ -1056,3 +1056,190 @@ mod root_integration {
         assert!(BpfJailerBpf::get_file_inode("/nonexistent/binary").is_err());
     }
 }
+
+/// Contract tests against the *compiled* BPF object.
+///
+/// The other root tests assert that userspace writes bytes at the offsets a
+/// hand-written Rust model says the C structs use. That catches userspace
+/// drifting from itself, but not userspace drifting from the C. These read the
+/// struct layout out of the object's BTF and the key/value sizes out of the
+/// loaded maps, so a change to `main.bpf.c` that userspace did not follow fails
+/// here instead of silently breaking every policy lookup.
+#[cfg(test)]
+mod btf_contract {
+    use bpfjailer_common::codec;
+
+    fn object_path() -> Option<std::path::PathBuf> {
+        let root = std::env::var("CARGO_MANIFEST_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)?
+            .parent()?
+            .to_path_buf();
+        let p = root.join("bpfjailer-bpf/target/bpfel-unknown-none/release/bpfjailer.bpf.o");
+        p.exists().then_some(p)
+    }
+
+    /// Byte offset of a named member of a named struct, straight from BTF.
+    fn member_offset(struct_name: &str, member: &str) -> Option<u32> {
+        let btf = libbpf_rs::btf::Btf::from_path(object_path()?).ok()?;
+        let s: libbpf_rs::btf::types::Struct<'_> = btf.type_by_name(struct_name)?;
+        for m in s.iter() {
+            if m.name?.to_str().ok()? == member {
+                return match m.attr {
+                    libbpf_rs::btf::types::MemberAttr::Normal { offset } => Some(offset / 8),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    /// Fail if the compiled object is older than the C sources.
+    ///
+    /// These tests read layout out of the `.o`. If that artifact is stale they
+    /// validate against something that no longer matches `main.bpf.c` and pass
+    /// for the wrong reason -- which happened during development, when a
+    /// root-owned target directory silently blocked the rebuild.
+    #[test]
+    #[ignore = "requires the built BPF object"]
+    fn compiled_object_is_not_older_than_the_bpf_sources() {
+        let Some(obj) = object_path() else {
+            eprintln!("skipping: BPF object not built");
+            return;
+        };
+        let obj_mtime = std::fs::metadata(&obj)
+            .expect("stat .o")
+            .modified()
+            .expect("mtime");
+        // obj is <root>/bpfjailer-bpf/target/bpfel-unknown-none/release/*.o,
+        // so the 4th ancestor is the bpfjailer-bpf crate directory itself.
+        let src_dir = obj
+            .ancestors()
+            .nth(4)
+            .expect("bpfjailer-bpf crate dir")
+            .join("src");
+        for entry in std::fs::read_dir(&src_dir).expect("read src dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("c") {
+                continue;
+            }
+            let src_mtime = entry
+                .metadata()
+                .expect("stat .c")
+                .modified()
+                .expect("mtime");
+            assert!(
+                obj_mtime >= src_mtime,
+                "{} is newer than the compiled object -- rebuild bpfjailer-bpf \
+                 before trusting these layout assertions",
+                path.display()
+            );
+        }
+    }
+
+    macro_rules! btf_or_skip {
+        ($e:expr) => {
+            match $e {
+                Some(v) => v,
+                None => {
+                    eprintln!("skipping: BPF object or BTF not available");
+                    return;
+                }
+            }
+        };
+    }
+
+    #[test]
+    #[ignore = "requires the built BPF object"]
+    fn path_state_key_offsets_match_the_encoder() {
+        assert_eq!(btf_or_skip!(member_offset("path_state_key", "role_id")), 0);
+        assert_eq!(btf_or_skip!(member_offset("path_state_key", "state")), 8);
+        assert_eq!(
+            btf_or_skip!(member_offset("path_state_key", "component_hash")),
+            16
+        );
+        // ...which is exactly what the encoder produces.
+        assert_eq!(codec::path_state_key(0, 0, 0).len(), 24);
+    }
+
+    #[test]
+    #[ignore = "requires the built BPF object"]
+    fn path_state_value_offsets_match_the_encoder() {
+        assert_eq!(
+            btf_or_skip!(member_offset("path_state_value", "next_state")),
+            0
+        );
+        assert_eq!(
+            btf_or_skip!(member_offset("path_state_value", "is_terminal")),
+            8
+        );
+        assert_eq!(
+            btf_or_skip!(member_offset("path_state_value", "decision")),
+            9
+        );
+        assert_eq!(
+            btf_or_skip!(member_offset("path_state_value", "wildcard")),
+            10
+        );
+        assert_eq!(codec::path_state_value(0, false, false, false).len(), 16);
+    }
+
+    #[test]
+    #[ignore = "requires the built BPF object"]
+    fn ip_rule_key_offsets_match_the_encoder() {
+        assert_eq!(btf_or_skip!(member_offset("ip_rule_key", "role_id")), 0);
+        assert_eq!(btf_or_skip!(member_offset("ip_rule_key", "ip_addr")), 4);
+        assert_eq!(btf_or_skip!(member_offset("ip_rule_key", "prefix_len")), 8);
+        assert_eq!(btf_or_skip!(member_offset("ip_rule_key", "direction")), 9);
+        assert_eq!(
+            codec::ip_rule_key(0, "0.0.0.0".parse().unwrap(), 0, 0).len(),
+            12
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the built BPF object"]
+    fn net_rule_key_offsets_match_the_encoder() {
+        assert_eq!(btf_or_skip!(member_offset("net_rule_key", "role_id")), 0);
+        assert_eq!(btf_or_skip!(member_offset("net_rule_key", "port")), 4);
+        assert_eq!(btf_or_skip!(member_offset("net_rule_key", "protocol")), 6);
+        assert_eq!(btf_or_skip!(member_offset("net_rule_key", "direction")), 7);
+        assert_eq!(codec::net_rule_key(0, 0, 0, 0).len(), 8);
+    }
+
+    #[test]
+    #[ignore = "requires the built BPF object"]
+    fn domain_and_path_rule_keys_pad_before_the_hash() {
+        assert_eq!(btf_or_skip!(member_offset("domain_rule_key", "role_id")), 0);
+        assert_eq!(
+            btf_or_skip!(member_offset("domain_rule_key", "domain_hash")),
+            8,
+            "4 bytes of padding after role_id"
+        );
+        assert_eq!(btf_or_skip!(member_offset("path_rule_key", "path_hash")), 8);
+    }
+
+    /// The loaded maps report their own key/value sizes, so this catches a
+    /// struct growing even if the offsets of existing members do not move.
+    #[test]
+    #[ignore = "requires root"]
+    fn loaded_map_key_and_value_sizes_match_the_encoders() {
+        let Ok(b) = super::BpfJailerBpf::load() else {
+            eprintln!("skipping: needs root and a BPF-capable kernel");
+            return;
+        };
+        let object = b.object.lock().unwrap();
+        let cases: [(&str, usize, usize); 4] = [
+            ("path_states", 24, 16),
+            ("ip_rules", 12, 1),
+            ("network_rules", 8, 1),
+            ("domain_rules", 16, 1),
+        ];
+        for (name, key, value) in cases {
+            let map = object.map(name).expect("map present");
+            assert_eq!(map.key_size() as usize, key, "{name} key size");
+            assert_eq!(map.value_size() as usize, value, "{name} value size");
+        }
+    }
+}

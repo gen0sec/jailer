@@ -1,0 +1,61 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The BPF objects are built by bpfjailer-bpf/build.rs via clang and are
+      # loaded at runtime, so they must be built before the userspace crates.
+      - name: Build BPF programs
+        working-directory: bpfjailer-bpf
+        run: cargo build --release
+
+      - name: Build workspace
+        run: cargo build --release --workspace
+
+      - name: Verify artifacts exist
+        run: |
+          test -f target/release/bpfjailer-bootstrap
+          test -f target/release/bpfjailer-daemon
+          test -f bpfjailer-bpf/target/bpfel-unknown-none/release/bpfjailer.bpf.o
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Build BPF programs
+        working-directory: bpfjailer-bpf
+        run: cargo build --release
+      - name: cargo fmt
+        run: cargo fmt --all --check
+        continue-on-error: true
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+        continue-on-error: true

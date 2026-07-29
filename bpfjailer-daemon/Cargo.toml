@@ -11,16 +11,17 @@ path = "src/main.rs"
 bpfjailer-common = { path = "../bpfjailer-common" }
 bpfjailer-client = { path = "../bpfjailer-client" }
 libbpf-rs = "0.21"
-libbpf-sys = "1.4"
 tokio = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-nix = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
-bytes = { workspace = true }
 x509-parser = "0.18"
 ring = "0.17"
 xattr = "1.3"
-libc = "0.2"
+
+# ring and x509-parser back the signature-validation path stubbed out in
+# src/signed_binary.rs (README lists Signed Binaries as planned). They are
+# declared ahead of that work rather than removed and re-added.
+[package.metadata.cargo-machete]
+ignored = ["ring", "x509-parser"]

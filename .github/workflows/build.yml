@@ -17,7 +17,7 @@ jobs:
       - name: Install BPF build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev pkg-config
+          sudo apt-get install -y clang llvm libbpf-dev libelf-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
 

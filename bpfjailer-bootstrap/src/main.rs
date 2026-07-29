@@ -302,7 +302,7 @@ fn add_path_state(map: &libbpf_rs::Map, role_id: u32, pattern: &str, allowed: bo
                 0xFFFFFFFF
             }
         } else {
-            djb2_hash_u32(&format!("{}:{}", role_id, &components[..=i].join("/")))
+            djb2_hash_u32(&format!("{}:{}", role_id, components[..=i].join("/")))
         };
 
         let mut value = [0u8; 8];

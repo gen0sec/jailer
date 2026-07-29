@@ -408,7 +408,7 @@ impl BpfJailerBpf {
                 } // ACCEPT or REJECT
             } else {
                 // Generate unique state ID based on path so far
-                djb2_hash_u32(&format!("{}:{}", role_id, &components[..=i].join("/")))
+                djb2_hash_u32(&format!("{}:{}", role_id, components[..=i].join("/")))
             };
 
             // struct path_state_value { u32 next_state; u8 is_terminal; u8 decision; u8 wildcard; u8 _pad; }

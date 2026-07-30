@@ -1,3 +1,4 @@
+pub mod apply;
 pub mod codec;
 pub mod flags;
 pub mod hash;

@@ -139,14 +139,6 @@ impl ProcessTracker {
         Ok(())
     }
 
-    /// Add a path rule for a role (legacy hash-based)
-    #[allow(dead_code)]
-    pub fn add_path_rule(&self, role_id: RoleId, path: &str, allowed: bool) -> Result<()> {
-        self.bpf
-            .add_path_rule(role_id.0, path, allowed)
-            .context("Failed to add path rule")
-    }
-
     /// Add a path state (dentry-walking state machine)
     pub fn add_path_state(&self, role_id: RoleId, pattern: &str, allowed: bool) -> Result<()> {
         self.bpf
@@ -429,12 +421,10 @@ mod root_integration {
 
     #[test]
     #[ignore = "requires root"]
-    fn add_path_state_and_path_rule_are_both_accepted() {
+    fn add_path_state_is_accepted() {
         let t = tracker_or_skip!();
         t.add_path_state(RoleId(26), "/srv/data/", false)
             .expect("state");
-        t.add_path_rule(RoleId(26), "/srv/data/secret", false)
-            .expect("rule");
     }
 
     #[test]

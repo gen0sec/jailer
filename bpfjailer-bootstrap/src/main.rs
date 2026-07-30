@@ -380,7 +380,6 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
         "role_flags",
         "pending_enrollments",
         "network_rules",
-        "path_rules",
         "path_states",
         "inode_cache",
         "cache_generation",

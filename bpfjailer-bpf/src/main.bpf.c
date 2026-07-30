@@ -137,21 +137,6 @@ struct {
     __type(value, u32);
 } cache_generation SEC(".maps");
 
-// Legacy path_rules map (kept for compatibility)
-#define PATH_RULE_MAX_LEN 256
-
-struct path_rule_key {
-    u32 role_id;
-    u64 path_hash;
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 8192);
-    __type(key, struct path_rule_key);
-    __type(value, u8);
-} path_rules SEC(".maps");
-
 // Auto-enrollment by executable inode
 struct exec_enrollment_value {
     u64 pod_id;
@@ -407,7 +392,15 @@ static __always_inline int check_path_state_machine(u32 role_id, struct path_com
     if (buf->count == 0)
         return 0;  // No rule
 
-    u32 state = PATH_STATE_ROOT;
+    // Width is taken from the map key rather than spelled out, and asserted
+    // below: a u32 here silently truncated the u64 next_state, so every
+    // pattern with more than one component missed on its second lookup and
+    // the walk fell through to the role's default.
+    typeof(((struct path_state_key *)0)->state) state = PATH_STATE_ROOT;
+    _Static_assert(sizeof(state) == sizeof(((struct path_state_key *)0)->state),
+                   "path walk state must be exactly as wide as path_state_key.state");
+    _Static_assert(sizeof(state) == sizeof(((struct path_state_value *)0)->next_state),
+                   "path walk state must be exactly as wide as path_state_value.next_state");
     // Zeroed explicitly: the struct has 4 bytes of padding before .state, and
     // a BPF hash lookup compares the whole key. An initializer list leaves that
     // padding as whatever the stack held, so lookups match only by luck.

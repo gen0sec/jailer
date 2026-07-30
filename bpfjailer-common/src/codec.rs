@@ -664,6 +664,148 @@ mod dns_cache_tests {
 /// unpadded `dns_cache_key` hit every time while the padded `domain_rule_key`
 /// beside it missed at random. These tests fail if a padded key is ever
 /// initialized that way again.
+/// The walk that consumes `path_state_entries`, mirrored in Rust so the
+/// encoder's semantics are pinned by tests rather than only by a booted VM.
+///
+/// This is a mirror, not the enforcement path: it cannot catch a change made
+/// only in the BPF program. It exists because the encoder side had no coverage
+/// of what a rule set actually decides, which is how an inert allow-list went
+/// unnoticed.
+#[cfg(test)]
+mod path_walk_semantics {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Mirrors MAX_COMPONENTS in the BPF program.
+    const MAX_COMPONENTS: usize = 16;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Decision {
+        Allow,
+        Deny,
+        /// No transition matched. The BPF program returns 0 here and the
+        /// caller falls back to the role's allow_file_access flag.
+        NoRule,
+    }
+
+    fn rules(role: u32, patterns: &[(&str, bool)]) -> HashMap<[u8; 24], [u8; 16]> {
+        let mut map = HashMap::new();
+        for (pattern, allow) in patterns {
+            for (k, v) in path_state_entries(role, pattern, *allow) {
+                map.insert(k, v);
+            }
+        }
+        map
+    }
+
+    /// Walks a path exactly as check_path_state_machine does: exact component
+    /// first, then the wildcard slot, terminal wins, otherwise carry the state.
+    fn walk(map: &HashMap<[u8; 24], [u8; 16]>, role: u32, path: &str, truncate: bool) -> Decision {
+        let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let mut state: u64 = 0;
+
+        for component in components.iter().take(MAX_COMPONENTS) {
+            let hash = fnv1a_hash_u64(component);
+            let value = map
+                .get(&path_state_key(role, state, hash))
+                .or_else(|| map.get(&path_state_key(role, state, 0)));
+
+            let Some(value) = value else {
+                return Decision::NoRule;
+            };
+            if value[8] == 1 {
+                return if value[9] == 1 {
+                    Decision::Allow
+                } else {
+                    Decision::Deny
+                };
+            }
+            let next = u64::from_ne_bytes(value[0..8].try_into().unwrap());
+            // The bug this reproduces: the walk held the state in a u32.
+            state = if truncate {
+                u64::from(next as u32)
+            } else {
+                next
+            };
+        }
+
+        match map.get(&path_state_key(role, state, 0)) {
+            Some(v) if v[8] == 1 => {
+                if v[9] == 1 {
+                    Decision::Allow
+                } else {
+                    Decision::Deny
+                }
+            }
+            _ => Decision::NoRule,
+        }
+    }
+
+    fn decide(patterns: &[(&str, bool)], path: &str) -> Decision {
+        walk(&rules(7, patterns), 7, path, false)
+    }
+
+    #[test]
+    fn an_allow_list_admits_what_it_lists_and_is_silent_about_the_rest() {
+        let list = &[("/etc/*", true), ("/usr/*", true)][..];
+
+        assert_eq!(decide(list, "/etc/hostname"), Decision::Allow);
+        assert_eq!(decide(list, "/usr/bin/cat"), Decision::Allow);
+        // Not listed: no rule, so the role's allow_file_access decides. With
+        // that flag false this denies, which is the intended default-deny --
+        // but it must come from the flag, not from the list failing to match.
+        assert_eq!(decide(list, "/root/secret.txt"), Decision::NoRule);
+    }
+
+    #[test]
+    fn an_exact_multi_component_rule_covers_only_that_path() {
+        let list = &[("/root/secret.txt", false)][..];
+
+        assert_eq!(decide(list, "/root/secret.txt"), Decision::Deny);
+        assert_eq!(decide(list, "/root/other.txt"), Decision::NoRule);
+    }
+
+    #[test]
+    fn a_wildcard_covers_the_directory_and_nothing_outside_it() {
+        let list = &[("/root/*", false)][..];
+
+        assert_eq!(decide(list, "/root/secret.txt"), Decision::Deny);
+        assert_eq!(decide(list, "/root/other.txt"), Decision::Deny);
+        assert_eq!(decide(list, "/etc/hostname"), Decision::NoRule);
+    }
+
+    #[test]
+    fn a_single_component_rule_covers_everything_beneath_it() {
+        assert_eq!(
+            decide(&[("/root", false)], "/root/secret.txt"),
+            Decision::Deny
+        );
+    }
+
+    /// The regression itself. Truncating the carried state to 32 bits turns
+    /// every multi-component rule into "no rule", so an allow-list admits
+    /// nothing and a deny-list denies nothing -- while single-component rules
+    /// keep working, which is what made it look functional.
+    #[test]
+    fn truncating_the_carried_state_makes_multi_component_rules_inert() {
+        let denies = rules(7, &[("/root/secret.txt", false)]);
+        assert_eq!(walk(&denies, 7, "/root/secret.txt", false), Decision::Deny);
+        assert_eq!(
+            walk(&denies, 7, "/root/secret.txt", true),
+            Decision::NoRule,
+            "a 32-bit state must break this; if it does not, the test no longer              reproduces the bug it is guarding against"
+        );
+
+        let allows = rules(7, &[("/etc/*", true)]);
+        assert_eq!(walk(&allows, 7, "/etc/hostname", false), Decision::Allow);
+        assert_eq!(walk(&allows, 7, "/etc/hostname", true), Decision::NoRule);
+
+        // Single component: unaffected either way.
+        let single = rules(7, &[("/root", false)]);
+        assert_eq!(walk(&single, 7, "/root/secret.txt", true), Decision::Deny);
+    }
+}
+
 #[cfg(test)]
 mod path_state_chaining {
     use super::*;

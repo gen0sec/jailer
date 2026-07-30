@@ -113,11 +113,6 @@ impl BpfJailerBpf {
         }
         log::info!("✓ network_rules map available for port/protocol filtering");
 
-        if map_by_name(&object, "path_rules").is_none() {
-            return Err(anyhow::anyhow!("path_rules map not found"));
-        }
-        log::info!("✓ path_rules map available for path matching");
-
         if map_by_name(&object, "path_states").is_none() {
             return Err(anyhow::anyhow!("path_states map not found"));
         }
@@ -374,47 +369,6 @@ impl BpfJailerBpf {
         key[4..6].copy_from_slice(&port.to_ne_bytes());
         key[6] = protocol;
         key[7] = direction;
-
-        map.delete(&key)?;
-        Ok(())
-    }
-
-    /// Add a path rule for a role
-    /// path: The path or prefix to match (e.g., "/var/www/", "/tmp/")
-    /// allowed: true = allow, false = deny
-    pub fn add_path_rule(&self, role_id: u32, path: &str, allowed: bool) -> Result<()> {
-        let object = self.object.lock().unwrap();
-        let map = map_by_name(&object, "path_rules")
-            .ok_or_else(|| anyhow::anyhow!("path_rules map not found"))?;
-
-        let key = codec::path_rule_key(role_id, path);
-
-        let value = [if allowed { 1u8 } else { 0u8 }];
-        map.update(&key, &value, MapFlags::empty())?;
-
-        let action = if allowed { "ALLOW" } else { "DENY" };
-        log::info!(
-            "Path rule: role={} path=\"{}\" -> {}",
-            role_id,
-            path,
-            action
-        );
-
-        Ok(())
-    }
-
-    /// Remove a path rule
-    #[allow(dead_code)]
-    pub fn remove_path_rule(&self, role_id: u32, path: &str) -> Result<()> {
-        let object = self.object.lock().unwrap();
-        let map = map_by_name(&object, "path_rules")
-            .ok_or_else(|| anyhow::anyhow!("path_rules map not found"))?;
-
-        let path_hash = bpfjailer_common::hash::fnv1a_hash_u64(path);
-
-        let mut key = [0u8; 16];
-        key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-        key[8..16].copy_from_slice(&path_hash.to_ne_bytes());
 
         map.delete(&key)?;
         Ok(())
@@ -727,7 +681,6 @@ impl BpfJailerBpf {
             "role_flags",
             "pending_enrollments",
             "network_rules",
-            "path_rules",
             "path_states",
             "inode_cache",
             "cache_generation",
@@ -863,7 +816,6 @@ mod root_integration {
             "role_flags",
             "pending_enrollments",
             "network_rules",
-            "path_rules",
             "path_states",
             "inode_cache",
             "exec_enrollment",
@@ -911,17 +863,6 @@ mod root_integration {
         b.remove_network_rule(3, 443, codec::PROTO_TCP, 1)
             .expect("remove");
         assert!(lookup(&b, "network_rules", &key).is_none(), "entry removed");
-    }
-
-    #[test]
-    #[ignore = "requires root"]
-    fn path_rule_round_trips_and_removes() {
-        let b = bpf_or_skip!();
-        b.add_path_rule(1, "/etc/shadow", false).expect("add");
-        let key = codec::path_rule_key(1, "/etc/shadow");
-        assert_eq!(lookup(&b, "path_rules", &key).map(|v| v[0]), Some(0));
-        b.remove_path_rule(1, "/etc/shadow").expect("remove");
-        assert!(lookup(&b, "path_rules", &key).is_none());
     }
 
     #[test]
@@ -1230,14 +1171,13 @@ mod btf_contract {
 
     #[test]
     #[ignore = "requires the built BPF object"]
-    fn domain_and_path_rule_keys_pad_before_the_hash() {
+    fn the_domain_rule_key_pads_before_the_hash() {
         assert_eq!(btf_or_skip!(member_offset("domain_rule_key", "role_id")), 0);
         assert_eq!(
             btf_or_skip!(member_offset("domain_rule_key", "domain_hash")),
             8,
             "4 bytes of padding after role_id"
         );
-        assert_eq!(btf_or_skip!(member_offset("path_rule_key", "path_hash")), 8);
     }
 
     /// The loaded maps report their own key/value sizes, so this catches a

@@ -117,14 +117,6 @@ pub fn net_rule_key(role_id: u32, port: u16, protocol: u8, direction: u8) -> [u8
     k
 }
 
-/// `struct path_rule_key { u32 role_id; u64 path_hash; }` (4 bytes padding)
-pub fn path_rule_key(role_id: u32, path: &str) -> [u8; 16] {
-    let mut k = [0u8; 16];
-    k[0..4].copy_from_slice(&role_id.to_ne_bytes());
-    k[8..16].copy_from_slice(&fnv1a_hash_u64(path).to_ne_bytes());
-    k
-}
-
 /// `struct domain_rule_key { u32 role_id; u64 domain_hash; }` (4 bytes padding)
 pub fn domain_rule_key(role_id: u32, domain: &str) -> [u8; 16] {
     let mut k = [0u8; 16];
@@ -370,13 +362,10 @@ mod tests {
     }
 
     #[test]
-    fn path_and_domain_rule_keys_pad_before_the_hash() {
-        let k = path_rule_key(5, "/etc/shadow");
-        assert_eq!(le32(&k[0..4]), 5);
-        assert_eq!(&k[4..8], &[0, 0, 0, 0]);
-        assert_eq!(le(&k[8..16]), fnv1a_hash_u64("/etc/shadow"));
-
+    fn the_domain_rule_key_pads_before_the_hash() {
         let d = domain_rule_key(5, "api.example.com");
+        assert_eq!(le32(&d[0..4]), 5);
+        assert_eq!(&d[4..8], &[0, 0, 0, 0]);
         assert_eq!(le(&d[8..16]), fnv1a_hash_u64("api.example.com"));
     }
 
@@ -675,6 +664,54 @@ mod dns_cache_tests {
 /// unpadded `dns_cache_key` hit every time while the padded `domain_rule_key`
 /// beside it missed at random. These tests fail if a padded key is ever
 /// initialized that way again.
+#[cfg(test)]
+mod path_state_chaining {
+    use super::*;
+
+    /// The walk in the BPF program carries the state between components. It
+    /// held that state in a u32 while these values are u64, so every pattern
+    /// with more than one component missed on its second lookup and silently
+    /// fell through to the role default. A single-component pattern kept
+    /// working, which is why it looked like path rules worked at all.
+    #[test]
+    fn intermediate_states_do_not_fit_in_a_u32() {
+        let entries = path_state_entries(7, "/root/secret.txt", false);
+        assert_eq!(entries.len(), 2, "two components, two transitions");
+
+        let next_state = u64::from_ne_bytes(entries[0].1[0..8].try_into().unwrap());
+        assert!(
+            next_state > u64::from(u32::MAX),
+            "intermediate state {next_state:#x} happens to fit in a u32; pick another              pattern for this test, the point is that these values generally do not"
+        );
+    }
+
+    #[test]
+    fn each_component_starts_from_the_state_the_previous_one_produced() {
+        let entries = path_state_entries(7, "/var/lib/data", true);
+        assert_eq!(entries.len(), 3);
+
+        for pair in entries.windows(2) {
+            let produced = u64::from_ne_bytes(pair[0].1[0..8].try_into().unwrap());
+            let consumed = u64::from_ne_bytes(pair[1].0[8..16].try_into().unwrap());
+            assert_eq!(
+                produced, consumed,
+                "the chain only walks if each key resumes from the previous next_state;                  truncating either side breaks every multi-component pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_component_pattern_terminates_immediately() {
+        let entries = path_state_entries(7, "/root", false);
+        assert_eq!(entries.len(), 1);
+        let next_state = u64::from_ne_bytes(entries[0].1[0..8].try_into().unwrap());
+        assert_eq!(
+            next_state, PATH_STATE_REJECT,
+            "no intermediate state to carry, which is why this kept working"
+        );
+    }
+}
+
 #[cfg(test)]
 mod bpf_key_padding {
     const SRC: &str = include_str!("../../bpfjailer-bpf/src/main.bpf.c");

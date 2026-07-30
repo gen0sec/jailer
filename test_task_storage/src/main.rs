@@ -1,5 +1,6 @@
 use anyhow::Result;
-use libbpf_rs::{ObjectBuilder};
+use libbpf_rs::{MapCore as _, ObjectBuilder};
+use std::ffi::OsStr;
 use log::{error, info};
 use std::path::PathBuf;
 
@@ -31,14 +32,14 @@ fn main() -> Result<()> {
             info!("✅ SUCCESS: task_storage map created successfully!");
 
             // Check if map exists
-            if object.map("test_task_storage").is_some() {
+            if object.maps().any(|m| m.name() == OsStr::new("test_task_storage")) {
                 info!("✅ Map 'test_task_storage' found in object");
             } else {
                 error!("❌ Map 'test_task_storage' not found in object");
             }
 
             // Check if program exists
-            if object.prog("test_task_alloc").is_some() {
+            if object.progs().any(|p| p.name() == OsStr::new("test_task_alloc")) {
                 info!("✅ Program 'test_task_alloc' found in object");
             } else {
                 error!("❌ Program 'test_task_alloc' not found in object");

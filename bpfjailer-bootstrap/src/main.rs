@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use bpfjailer_common::policy::PolicyConfig;
+use libbpf_rs::MapCore;
 use libbpf_rs::{Link, MapFlags, Object, ObjectBuilder};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -13,6 +14,28 @@ use std::path::{Path, PathBuf};
 const BPF_PIN_PATH: &str = "/sys/fs/bpf/bpfjailer";
 const DEFAULT_POLICY_PATH: &str = "/etc/bpfjailer/policy.json";
 const LOCAL_POLICY_PATH: &str = "config/policy.json";
+
+/// Find a map by name.
+///
+/// libbpf-rs 0.26 removed `Object::map(name)`/`map_mut(name)` in favour of
+/// iterating. `update` is a `MapCore` method taking `&self`, so the immutable
+/// iterator is enough here.
+fn map_by_name<'a>(object: &'a Object, name: &str) -> Option<libbpf_rs::Map<'a>> {
+    let want = std::ffi::OsStr::new(name);
+    object.maps().find(|m| m.name() == want)
+}
+
+/// Find a map by name for operations that mutate it, such as pinning.
+fn map_mut_by_name<'a>(object: &'a mut Object, name: &str) -> Option<libbpf_rs::MapMut<'a>> {
+    let want = std::ffi::OsStr::new(name);
+    object.maps_mut().find(|m| m.name() == want)
+}
+
+/// Find a program by name. `Object::prog_mut(name)` was removed in 0.26.
+fn prog_by_name<'a>(object: &'a Object, name: &str) -> Option<libbpf_rs::ProgramMut<'a>> {
+    let want = std::ffi::OsStr::new(name);
+    object.progs_mut().find(|p| p.name() == want)
+}
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -122,7 +145,7 @@ fn load_bpf_object() -> Result<(Object, Vec<Link>)> {
 
     let mut object_builder = ObjectBuilder::default();
     let open_object = object_builder.open_file(obj_path)?;
-    let mut object = open_object.load().context("Failed to load BPF object")?;
+    let object = open_object.load().context("Failed to load BPF object")?;
 
     log::info!("BPF object loaded successfully");
 
@@ -143,7 +166,7 @@ fn load_bpf_object() -> Result<(Object, Vec<Link>)> {
 
     let mut links = Vec::new();
     for name in &program_names {
-        if let Some(prog) = object.prog_mut(name) {
+        if let Some(prog) = prog_by_name(&object, name) {
             let link = prog
                 .attach()
                 .with_context(|| format!("Failed to attach {}", name))?;
@@ -166,7 +189,7 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
         let flags = bpfjailer_common::flags::policy_flags_to_u8(&role.flags);
 
         // Update role_flags map
-        if let Some(map) = object.map("role_flags") {
+        if let Some(map) = map_by_name(object, "role_flags") {
             let key = role_id.to_ne_bytes();
             let value = [flags];
             map.update(&key, &value, MapFlags::empty())?;
@@ -174,7 +197,7 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
         }
 
         // Load network rules
-        if let Some(map) = object.map("network_rules") {
+        if let Some(map) = map_by_name(object, "network_rules") {
             for rule in &role.network_rules {
                 let protocol = match rule.protocol.as_str() {
                     "tcp" | "TCP" => 6u8,
@@ -206,15 +229,15 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
         }
 
         // Load path rules (state machine)
-        if let Some(map) = object.map("path_states") {
+        if let Some(map) = map_by_name(object, "path_states") {
             for path_rule in &role.file_paths {
-                add_path_state(map, role_id, &path_rule.pattern, path_rule.allow)?;
+                add_path_state(&map, role_id, &path_rule.pattern, path_rule.allow)?;
             }
         }
     }
 
     // Load pod mappings
-    if let Some(map) = object.map("pod_to_role") {
+    if let Some(map) = map_by_name(object, "pod_to_role") {
         for pod in &policy.pods {
             let key = pod.id.to_ne_bytes();
             let value = pod.role_id.0.to_ne_bytes();
@@ -224,7 +247,7 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
     }
 
     // Load exec enrollments
-    if let Some(map) = object.map("exec_enrollment") {
+    if let Some(map) = map_by_name(object, "exec_enrollment") {
         for enrollment in &policy.exec_enrollments {
             if let Ok(metadata) = fs::metadata(&enrollment.executable_path) {
                 let inode = metadata.ino();
@@ -252,7 +275,7 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
     }
 
     // Load cgroup enrollments
-    if let Some(map) = object.map("cgroup_enrollment") {
+    if let Some(map) = map_by_name(object, "cgroup_enrollment") {
         for enrollment in &policy.cgroup_enrollments {
             if let Ok(metadata) = fs::metadata(&enrollment.cgroup_path) {
                 let cgroup_id = metadata.ino();
@@ -323,7 +346,7 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
     ];
 
     for name in &map_names {
-        if let Some(map) = object.map_mut(name) {
+        if let Some(mut map) = map_mut_by_name(object, name) {
             let pin_path = format!("{}/{}", maps_dir, name);
             if let Err(e) = map.pin(&pin_path) {
                 log::warn!("Failed to pin map {}: {}", name, e);
@@ -349,7 +372,7 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
     ];
 
     for name in &prog_names {
-        if let Some(prog) = object.prog_mut(name) {
+        if let Some(mut prog) = prog_by_name(object, name) {
             let pin_path = format!("{}/{}", progs_dir, name);
             if let Err(e) = prog.pin(&pin_path) {
                 log::warn!("Failed to pin program {}: {}", name, e);
@@ -494,8 +517,7 @@ mod root_integration {
         populate_maps(&mut object, &cfg).expect("populate");
 
         // role_flags: every bit must survive, not just the first three.
-        let flags = object
-            .map("role_flags")
+        let flags = map_by_name(&object, "role_flags")
             .expect("map")
             .lookup(&30u32.to_ne_bytes(), MapFlags::empty())
             .expect("lookup")
@@ -506,7 +528,7 @@ mod root_integration {
 
         // path_states: the deny rule must be present under the codec's key.
         let entries = bpfjailer_common::codec::path_state_entries(30, "/etc/shadow", false);
-        let map = object.map("path_states").expect("map");
+        let map = map_by_name(&object, "path_states").expect("map");
         for (key, value) in entries {
             let got = map
                 .lookup(&key, MapFlags::empty())
@@ -524,8 +546,7 @@ mod root_integration {
         };
         let cfg: PolicyConfig = serde_json::from_str(POLICY).expect("parse");
         populate_maps(&mut object, &cfg).expect("populate");
-        let v = object
-            .map("pod_to_role")
+        let v = map_by_name(&object, "pod_to_role")
             .expect("map")
             .lookup(&300u64.to_ne_bytes(), MapFlags::empty())
             .expect("lookup")
@@ -539,8 +560,8 @@ mod root_integration {
         let Some(object) = loaded_object() else {
             return;
         };
-        let map = object.map("path_states").expect("map");
-        add_path_state(map, 31, "/srv/data/", false).expect("add");
+        let map = map_by_name(&object, "path_states").expect("map");
+        add_path_state(&map, 31, "/srv/data/", false).expect("add");
         for (key, value) in bpfjailer_common::codec::path_state_entries(31, "/srv/data/", false) {
             let got = map
                 .lookup(&key, MapFlags::empty())

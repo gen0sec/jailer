@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bpfjailer_common::codec;
+use libbpf_rs::MapCore;
 use libbpf_rs::{MapFlags, Object, ObjectBuilder};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,22 @@ pub struct BpfJailerBpf {
 // The underlying libbpf handles are thread-safe for concurrent access
 unsafe impl Send for BpfJailerBpf {}
 unsafe impl Sync for BpfJailerBpf {}
+
+/// Find a program by name. `Object::prog_mut(name)` was removed in 0.26.
+fn prog_by_name<'a>(object: &'a Object, name: &str) -> Option<libbpf_rs::ProgramMut<'a>> {
+    let want = std::ffi::OsStr::new(name);
+    object.progs_mut().find(|p| p.name() == want)
+}
+
+/// Find a map by name.
+///
+/// libbpf-rs 0.26 removed `Object::map(name)` in favour of iterating
+/// `Object::maps()`. `update`/`delete` are `MapCore` methods taking `&self`,
+/// so the immutable iterator is sufficient for everything here.
+fn map_by_name<'a>(object: &'a Object, name: &str) -> Option<libbpf_rs::Map<'a>> {
+    let want = std::ffi::OsStr::new(name);
+    object.maps().find(|m| m.name() == want)
+}
 
 impl BpfJailerBpf {
     pub fn load() -> Result<Self> {
@@ -51,7 +68,7 @@ impl BpfJailerBpf {
         let open_object = object_builder.open_file(obj_path)?;
 
         // Try to load - this will create maps including task_storage
-        let mut object = match open_object.load() {
+        let object = match open_object.load() {
             Ok(obj) => obj,
             Err(e) => {
                 let err_str = e.to_string();
@@ -80,66 +97,66 @@ impl BpfJailerBpf {
         log::info!("BPF object loaded successfully");
 
         // Check that maps exist
-        if object.map("pod_to_role").is_none() {
+        if map_by_name(&object, "pod_to_role").is_none() {
             return Err(anyhow::anyhow!("pod_to_role map not found"));
         }
-        if object.map("role_flags").is_none() {
+        if map_by_name(&object, "role_flags").is_none() {
             return Err(anyhow::anyhow!("role_flags map not found"));
         }
-        if object.map("pending_enrollments").is_none() {
+        if map_by_name(&object, "pending_enrollments").is_none() {
             return Err(anyhow::anyhow!("pending_enrollments map not found"));
         }
         log::info!("✓ pending_enrollments map available for enrollment");
 
-        if object.map("network_rules").is_none() {
+        if map_by_name(&object, "network_rules").is_none() {
             return Err(anyhow::anyhow!("network_rules map not found"));
         }
         log::info!("✓ network_rules map available for port/protocol filtering");
 
-        if object.map("path_rules").is_none() {
+        if map_by_name(&object, "path_rules").is_none() {
             return Err(anyhow::anyhow!("path_rules map not found"));
         }
         log::info!("✓ path_rules map available for path matching");
 
-        if object.map("path_states").is_none() {
+        if map_by_name(&object, "path_states").is_none() {
             return Err(anyhow::anyhow!("path_states map not found"));
         }
         log::info!("✓ path_states map available for dentry-based path matching");
 
-        if object.map("inode_cache").is_none() {
+        if map_by_name(&object, "inode_cache").is_none() {
             log::warn!("inode_cache map not found (optional)");
         } else {
             log::info!("✓ inode_cache map available for caching");
         }
 
         // Auto-enrollment maps
-        if object.map("exec_enrollment").is_some() {
+        if map_by_name(&object, "exec_enrollment").is_some() {
             log::info!("✓ exec_enrollment map available for executable-based enrollment");
         }
-        if object.map("cgroup_enrollment").is_some() {
+        if map_by_name(&object, "cgroup_enrollment").is_some() {
             log::info!("✓ cgroup_enrollment map available for cgroup-based enrollment");
         }
 
         // AI agent security maps
-        if object.map("ip_rules").is_some() {
+        if map_by_name(&object, "ip_rules").is_some() {
             log::info!("✓ ip_rules map available for IP/CIDR filtering");
         }
-        if object.map("proxy_config").is_some() {
+        if map_by_name(&object, "proxy_config").is_some() {
             log::info!("✓ proxy_config map available for proxy enforcement");
         }
-        if object.map("domain_rules").is_some() {
+        if map_by_name(&object, "domain_rules").is_some() {
             log::info!("✓ domain_rules map available for domain filtering");
         }
-        if object.map("dns_cache").is_some() {
+        if map_by_name(&object, "dns_cache").is_some() {
             log::info!("✓ dns_cache map available for DNS tracking");
         }
-        if object.map("dns_pending").is_some() {
+        if map_by_name(&object, "dns_pending").is_some() {
             log::info!("✓ dns_pending map available for DNS query tracking");
         }
 
         // Note: task_storage map is automatically handled by libbpf-rs
         // It's created but we don't need to access it from userspace
-        if object.map("task_storage").is_some() {
+        if map_by_name(&object, "task_storage").is_some() {
             log::info!("✓ task_storage map created successfully");
         }
 
@@ -159,7 +176,7 @@ impl BpfJailerBpf {
 
         // LSM programs must be explicitly attached
         for name in &program_names {
-            match object.prog_mut(name) {
+            match prog_by_name(&object, name) {
                 Some(prog) => {
                     match prog.attach() {
                         Ok(link) => {
@@ -196,7 +213,7 @@ impl BpfJailerBpf {
     #[cfg(test)]
     pub(crate) fn map_lookup(&self, map_name: &str, key: &[u8]) -> Option<Vec<u8>> {
         let object = self.object.lock().unwrap();
-        let map = object.map(map_name)?;
+        let map = map_by_name(&object, map_name)?;
         map.lookup(key, MapFlags::empty()).ok().flatten()
     }
 
@@ -219,7 +236,7 @@ impl BpfJailerBpf {
 
         let result = {
             let object = self.object.lock().unwrap();
-            match object.map("task_storage") {
+            match map_by_name(&object, "task_storage") {
                 Some(map) => map
                     .lookup(&fd.to_ne_bytes(), MapFlags::empty())
                     .ok()
@@ -235,8 +252,7 @@ impl BpfJailerBpf {
 
     pub fn update_pod_role(&self, pod_id: u64, role_id: u32) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("pod_to_role")
+        let map = map_by_name(&object, "pod_to_role")
             .ok_or_else(|| anyhow::anyhow!("pod_to_role map not found"))?;
         let key = pod_id.to_ne_bytes();
         let value = role_id.to_ne_bytes();
@@ -246,8 +262,7 @@ impl BpfJailerBpf {
 
     pub fn update_role_flags(&self, role_id: u32, flags: u8) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("role_flags")
+        let map = map_by_name(&object, "role_flags")
             .ok_or_else(|| anyhow::anyhow!("role_flags map not found"))?;
         let key = role_id.to_ne_bytes();
         let value = [flags];
@@ -259,8 +274,7 @@ impl BpfJailerBpf {
     /// on the next syscall (file_open, exec, etc.)
     pub fn enroll_pending_process(&self, pid: u32, pod_id: u64, role_id: u32) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("pending_enrollments")
+        let map = map_by_name(&object, "pending_enrollments")
             .ok_or_else(|| anyhow::anyhow!("pending_enrollments map not found"))?;
 
         let key = pid.to_ne_bytes();
@@ -296,8 +310,7 @@ impl BpfJailerBpf {
         allowed: bool,
     ) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("network_rules")
+        let map = map_by_name(&object, "network_rules")
             .ok_or_else(|| anyhow::anyhow!("network_rules map not found"))?;
 
         let key = codec::net_rule_key(role_id, port, protocol, direction);
@@ -334,8 +347,7 @@ impl BpfJailerBpf {
         direction: u8,
     ) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("network_rules")
+        let map = map_by_name(&object, "network_rules")
             .ok_or_else(|| anyhow::anyhow!("network_rules map not found"))?;
 
         let mut key = [0u8; 8];
@@ -353,8 +365,7 @@ impl BpfJailerBpf {
     /// allowed: true = allow, false = deny
     pub fn add_path_rule(&self, role_id: u32, path: &str, allowed: bool) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("path_rules")
+        let map = map_by_name(&object, "path_rules")
             .ok_or_else(|| anyhow::anyhow!("path_rules map not found"))?;
 
         let key = codec::path_rule_key(role_id, path);
@@ -377,8 +388,7 @@ impl BpfJailerBpf {
     #[allow(dead_code)]
     pub fn remove_path_rule(&self, role_id: u32, path: &str) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("path_rules")
+        let map = map_by_name(&object, "path_rules")
             .ok_or_else(|| anyhow::anyhow!("path_rules map not found"))?;
 
         let path_hash = bpfjailer_common::hash::fnv1a_hash_u64(path);
@@ -399,8 +409,7 @@ impl BpfJailerBpf {
     ///   - Wildcards: "/var/lib/*/data" (* matches any single component)
     pub fn add_path_state(&self, role_id: u32, pattern: &str, allowed: bool) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("path_states")
+        let map = map_by_name(&object, "path_states")
             .ok_or_else(|| anyhow::anyhow!("path_states map not found"))?;
 
         let entries = codec::path_state_entries(role_id, pattern, allowed);
@@ -423,8 +432,7 @@ impl BpfJailerBpf {
 
     pub fn invalidate_cache(&self) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("cache_generation")
+        let map = map_by_name(&object, "cache_generation")
             .ok_or_else(|| anyhow::anyhow!("cache_generation map not found"))?;
 
         // Read current generation
@@ -455,8 +463,7 @@ impl BpfJailerBpf {
     /// All processes executing this binary will be auto-enrolled
     pub fn add_exec_enrollment(&self, inode: u64, pod_id: u64, role_id: u32) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("exec_enrollment")
+        let map = map_by_name(&object, "exec_enrollment")
             .ok_or_else(|| anyhow::anyhow!("exec_enrollment map not found"))?;
 
         let key = inode.to_ne_bytes();
@@ -480,8 +487,7 @@ impl BpfJailerBpf {
     #[allow(dead_code)]
     pub fn remove_exec_enrollment(&self, inode: u64) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("exec_enrollment")
+        let map = map_by_name(&object, "exec_enrollment")
             .ok_or_else(|| anyhow::anyhow!("exec_enrollment map not found"))?;
 
         let key = inode.to_ne_bytes();
@@ -494,8 +500,7 @@ impl BpfJailerBpf {
     /// All processes in this cgroup will be auto-enrolled
     pub fn add_cgroup_enrollment(&self, cgroup_id: u64, pod_id: u64, role_id: u32) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("cgroup_enrollment")
+        let map = map_by_name(&object, "cgroup_enrollment")
             .ok_or_else(|| anyhow::anyhow!("cgroup_enrollment map not found"))?;
 
         let key = cgroup_id.to_ne_bytes();
@@ -519,8 +524,7 @@ impl BpfJailerBpf {
     #[allow(dead_code)]
     pub fn remove_cgroup_enrollment(&self, cgroup_id: u64) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("cgroup_enrollment")
+        let map = map_by_name(&object, "cgroup_enrollment")
             .ok_or_else(|| anyhow::anyhow!("cgroup_enrollment map not found"))?;
 
         let key = cgroup_id.to_ne_bytes();
@@ -545,8 +549,7 @@ impl BpfJailerBpf {
         allowed: bool,
     ) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("ip_rules")
+        let map = map_by_name(&object, "ip_rules")
             .ok_or_else(|| anyhow::anyhow!("ip_rules map not found"))?;
 
         let (ip, prefix_len) = codec::parse_cidr(cidr).map_err(|e| anyhow::anyhow!(e))?;
@@ -573,8 +576,7 @@ impl BpfJailerBpf {
     #[allow(dead_code)]
     pub fn remove_ip_rule(&self, role_id: u32, cidr: &str, direction: u8) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("ip_rules")
+        let map = map_by_name(&object, "ip_rules")
             .ok_or_else(|| anyhow::anyhow!("ip_rules map not found"))?;
 
         // Must use the same encoder as add_ip_rule: these previously disagreed
@@ -589,8 +591,7 @@ impl BpfJailerBpf {
 
     pub fn set_proxy_config(&self, role_id: u32, proxy_addr: &str, required: bool) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("proxy_config")
+        let map = map_by_name(&object, "proxy_config")
             .ok_or_else(|| anyhow::anyhow!("proxy_config map not found"))?;
 
         let (ip, port) = codec::parse_proxy_addr(proxy_addr).map_err(|e| anyhow::anyhow!(e))?;
@@ -609,8 +610,7 @@ impl BpfJailerBpf {
     #[allow(dead_code)]
     pub fn remove_proxy_config(&self, role_id: u32) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("proxy_config")
+        let map = map_by_name(&object, "proxy_config")
             .ok_or_else(|| anyhow::anyhow!("proxy_config map not found"))?;
 
         let key = role_id.to_ne_bytes();
@@ -624,8 +624,7 @@ impl BpfJailerBpf {
     /// allowed: true = allow, false = deny
     pub fn add_domain_rule(&self, role_id: u32, domain: &str, allowed: bool) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("domain_rules")
+        let map = map_by_name(&object, "domain_rules")
             .ok_or_else(|| anyhow::anyhow!("domain_rules map not found"))?;
 
         let key = codec::domain_rule_key(role_id, domain);
@@ -643,8 +642,7 @@ impl BpfJailerBpf {
     #[allow(dead_code)]
     pub fn remove_domain_rule(&self, role_id: u32, domain: &str) -> Result<()> {
         let object = self.object.lock().unwrap();
-        let map = object
-            .map("domain_rules")
+        let map = map_by_name(&object, "domain_rules")
             .ok_or_else(|| anyhow::anyhow!("domain_rules map not found"))?;
 
         let domain_hash = bpfjailer_common::hash::fnv1a_hash_u64(domain);
@@ -720,7 +718,7 @@ impl BpfJailerBpf {
         ];
 
         for name in &map_names {
-            if object.map(name).is_some() {
+            if map_by_name(&object, name).is_some() {
                 let pin_path = format!("{}/{}", maps_dir, name);
                 // Note: pin() requires &mut self in some versions
                 // This is a limitation - in daemon mode we'd need mutable access
@@ -856,7 +854,7 @@ mod root_integration {
             "domain_rules",
             "task_storage",
         ] {
-            assert!(object.map(name).is_some(), "map {name} missing");
+            assert!(map_by_name(&object, name).is_some(), "map {name} missing");
         }
     }
 
@@ -1067,7 +1065,9 @@ mod root_integration {
 /// here instead of silently breaking every policy lookup.
 #[cfg(test)]
 mod btf_contract {
+    use super::map_by_name;
     use bpfjailer_common::codec;
+    use libbpf_rs::MapCore as _;
 
     fn object_path() -> Option<std::path::PathBuf> {
         let root = std::env::var("CARGO_MANIFEST_DIR")
@@ -1084,7 +1084,8 @@ mod btf_contract {
         let btf = libbpf_rs::btf::Btf::from_path(object_path()?).ok()?;
         let s: libbpf_rs::btf::types::Struct<'_> = btf.type_by_name(struct_name)?;
         for m in s.iter() {
-            if m.name?.to_str().ok()? == member {
+            // 0.26 exposes member names as OsStr rather than CStr.
+            if m.name? == std::ffi::OsStr::new(member) {
                 return match m.attr {
                     libbpf_rs::btf::types::MemberAttr::Normal { offset } => Some(offset / 8),
                     _ => None,
@@ -1237,7 +1238,7 @@ mod btf_contract {
             ("domain_rules", 16, 1),
         ];
         for (name, key, value) in cases {
-            let map = object.map(name).expect("map present");
+            let map = map_by_name(&object, name).expect("map present");
             assert_eq!(map.key_size() as usize, key, "{name} key size");
             assert_eq!(map.value_size() as usize, value, "{name} value size");
         }

@@ -14,7 +14,8 @@ updates:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
     # Major bumps of the BPF loader change the API surface and need a manual
-    # migration, so they should not be raised automatically.
+    # migration, so they should not be raised automatically. Kept after the
+    # 0.21 -> 0.26 migration: the next major will break the same way.
     ignore:
       - dependency-name: "libbpf-rs"
         update-types: ["version-update:semver-major"]

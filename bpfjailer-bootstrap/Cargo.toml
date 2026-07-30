@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 bpfjailer-common = { path = "../bpfjailer-common" }
-libbpf-rs = "0.21"
+libbpf-rs = "0.26"
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }

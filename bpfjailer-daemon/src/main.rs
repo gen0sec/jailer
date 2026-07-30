@@ -81,31 +81,21 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Apply IP rules, domain rules, and proxy config from policy
+    // Apply every role through the shared walk, so the daemon and the
+    // daemonless bootstrap honour exactly the same sections of a policy.
+    // Enrollment re-applies flags/paths/network per process; the writes are
+    // idempotent, so doing them eagerly here as well is harmless.
     {
         let pm = policy_manager.read().await;
-        for role in pm.config().roles.values() {
-            let role_id = role.id;
-
-            // Apply IP rules
-            if !role.ip_rules.is_empty() {
-                if let Err(e) = process_tracker.apply_ip_rules(role_id, &role.ip_rules) {
-                    warn!("Failed to apply IP rules for role {}: {}", role_id.0, e);
+        for (name, role) in &pm.config().roles {
+            let mut sink = process_tracker::TrackerSink(&process_tracker);
+            match bpfjailer_common::apply::apply_role(&mut sink, role) {
+                Ok(skipped) => {
+                    for s in skipped {
+                        warn!("Role '{}': skipped {}", name, s);
+                    }
                 }
-            }
-
-            // Apply domain rules
-            if !role.domain_rules.is_empty() {
-                if let Err(e) = process_tracker.apply_domain_rules(role_id, &role.domain_rules) {
-                    warn!("Failed to apply domain rules for role {}: {}", role_id.0, e);
-                }
-            }
-
-            // Apply proxy config
-            if let Some(ref proxy) = role.proxy {
-                if let Err(e) = process_tracker.set_proxy_config(role_id, proxy) {
-                    warn!("Failed to set proxy config for role {}: {}", role_id.0, e);
-                }
+                Err(e) => warn!("Failed to apply role '{}': {}", name, e),
             }
         }
     }

@@ -4,6 +4,8 @@
 //! After setup, exits immediately. Programs remain active until reboot.
 
 use anyhow::{Context, Result};
+use bpfjailer_common::apply::{apply_role, PolicySink};
+use bpfjailer_common::codec;
 use bpfjailer_common::policy::PolicyConfig;
 use libbpf_rs::MapCore;
 use libbpf_rs::{Link, MapFlags, Object, ObjectBuilder};
@@ -180,60 +182,97 @@ fn load_bpf_object() -> Result<(Object, Vec<Link>)> {
     Ok((object, links))
 }
 
+/// Writes role rules straight into the loaded object's maps.
+///
+/// The bootstrap has no daemon abstractions, so this is the thinnest possible
+/// adapter between [`apply_role`] and the raw maps.
+struct ObjectSink<'a> {
+    object: &'a Object,
+}
+
+impl ObjectSink<'_> {
+    fn map(&self, name: &str) -> Result<libbpf_rs::Map<'_>> {
+        map_by_name(self.object, name).ok_or_else(|| anyhow::anyhow!("{name} map not found"))
+    }
+}
+
+impl PolicySink for ObjectSink<'_> {
+    type Err = anyhow::Error;
+
+    fn set_role_flags(&mut self, role_id: u32, flags: u8) -> Result<()> {
+        self.map("role_flags")?
+            .update(&role_id.to_ne_bytes(), &[flags], MapFlags::empty())?;
+        Ok(())
+    }
+
+    fn add_path_state(&mut self, role_id: u32, pattern: &str, allow: bool) -> Result<()> {
+        let map = self.map("path_states")?;
+        for (key, value) in codec::path_state_entries(role_id, pattern, allow) {
+            map.update(&key, &value, MapFlags::empty())?;
+        }
+        Ok(())
+    }
+
+    fn add_network_rule(
+        &mut self,
+        role_id: u32,
+        port: u16,
+        protocol: u8,
+        direction: u8,
+        allow: bool,
+    ) -> Result<()> {
+        self.map("network_rules")?.update(
+            &codec::net_rule_key(role_id, port, protocol, direction),
+            &[allow as u8],
+            MapFlags::empty(),
+        )?;
+        Ok(())
+    }
+
+    fn add_ip_rule(&mut self, role_id: u32, cidr: &str, direction: u8, allow: bool) -> Result<()> {
+        let (ip, prefix_len) = codec::parse_cidr(cidr).map_err(|e| anyhow::anyhow!(e))?;
+        self.map("ip_rules")?.update(
+            &codec::ip_rule_key(role_id, ip, prefix_len, direction),
+            &[allow as u8],
+            MapFlags::empty(),
+        )?;
+        Ok(())
+    }
+
+    fn add_domain_rule(&mut self, role_id: u32, domain: &str, allow: bool) -> Result<()> {
+        self.map("domain_rules")?.update(
+            &codec::domain_rule_key(role_id, domain),
+            &[allow as u8],
+            MapFlags::empty(),
+        )?;
+        Ok(())
+    }
+
+    fn set_proxy(&mut self, role_id: u32, address: &str, required: bool) -> Result<()> {
+        let (ip, port) = codec::parse_proxy_addr(address).map_err(|e| anyhow::anyhow!(e))?;
+        self.map("proxy_config")?.update(
+            &role_id.to_ne_bytes(),
+            &codec::proxy_config_value(ip, port, required),
+            MapFlags::empty(),
+        )?;
+        Ok(())
+    }
+}
+
 fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
     log::info!("Populating BPF maps from policy...");
 
-    // Load roles and their flags
+    // Roles are applied through the shared walk in bpfjailer_common::apply, so
+    // the daemon and this bootstrap cannot diverge on which sections they
+    // honour. They previously did: this path silently ignored ip_rules,
+    // domain_rules and proxy entirely.
     for (name, role) in &policy.roles {
-        let role_id = role.id.0;
-        let flags = bpfjailer_common::flags::policy_flags_to_u8(&role.flags);
-
-        // Update role_flags map
-        if let Some(map) = map_by_name(object, "role_flags") {
-            let key = role_id.to_ne_bytes();
-            let value = [flags];
-            map.update(&key, &value, MapFlags::empty())?;
-            log::info!("Role '{}' (id={}) flags={:#x}", name, role_id, flags);
+        let mut sink = ObjectSink { object };
+        let skipped = apply_role(&mut sink, role)?;
+        for s in skipped {
+            log::warn!("Role '{}': skipped {}", name, s);
         }
-
-        // Load network rules
-        if let Some(map) = map_by_name(object, "network_rules") {
-            for rule in &role.network_rules {
-                let protocol = match rule.protocol.as_str() {
-                    "tcp" | "TCP" => 6u8,
-                    "udp" | "UDP" => 17u8,
-                    _ => continue,
-                };
-
-                let ports: Vec<u16> = if let Some(port) = rule.port {
-                    vec![port]
-                } else if let (Some(start), Some(end)) = (rule.port_start, rule.port_end) {
-                    (start..=end).collect()
-                } else {
-                    continue;
-                };
-
-                for port in ports {
-                    // Add both bind and connect rules
-                    for direction in [0u8, 1u8] {
-                        let mut key = [0u8; 8];
-                        key[0..4].copy_from_slice(&role_id.to_ne_bytes());
-                        key[4..6].copy_from_slice(&port.to_ne_bytes());
-                        key[6] = protocol;
-                        key[7] = direction;
-                        let value = [if rule.allow { 1u8 } else { 0u8 }];
-                        map.update(&key, &value, MapFlags::empty())?;
-                    }
-                }
-            }
-        }
-
-        // Load path rules (state machine)
-        if let Some(map) = map_by_name(object, "path_states") {
-            for path_rule in &role.file_paths {
-                add_path_state(&map, role_id, &path_rule.pattern, path_rule.allow)?;
-            }
-        }
+        log::info!("Role '{}' (id={}) applied", name, role.id.0);
     }
 
     // Load pod mappings
@@ -303,15 +342,6 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
     }
 
     log::info!("BPF maps populated");
-    Ok(())
-}
-
-fn add_path_state(map: &libbpf_rs::Map, role_id: u32, pattern: &str, allowed: bool) -> Result<()> {
-    // Shared with the daemon: both sides must produce byte-identical keys, so
-    // the walk lives in bpfjailer_common::codec rather than being duplicated.
-    for (key, value) in bpfjailer_common::codec::path_state_entries(role_id, pattern, allowed) {
-        map.update(&key, &value, MapFlags::empty())?;
-    }
     Ok(())
 }
 
@@ -556,12 +586,13 @@ mod root_integration {
 
     #[test]
     #[ignore = "requires root"]
-    fn add_path_state_matches_the_shared_codec() {
+    fn object_sink_writes_path_states_matching_the_codec() {
         let Some(object) = loaded_object() else {
             return;
         };
+        let mut sink = ObjectSink { object: &object };
+        sink.add_path_state(31, "/srv/data/", false).expect("add");
         let map = map_by_name(&object, "path_states").expect("map");
-        add_path_state(&map, 31, "/srv/data/", false).expect("add");
         for (key, value) in bpfjailer_common::codec::path_state_entries(31, "/srv/data/", false) {
             let got = map
                 .lookup(&key, MapFlags::empty())

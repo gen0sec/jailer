@@ -1,8 +1,6 @@
 use crate::bpf_loader::BpfJailerBpf;
 use anyhow::{Context, Result};
-use bpfjailer_common::{
-    DomainRule, IpRule, NetworkRule, PathPattern, PodId, PolicyFlags, ProxyConfig, RoleId,
-};
+use bpfjailer_common::{NetworkRule, PathPattern, PodId, PolicyFlags, ProxyConfig, RoleId};
 use log::{debug, info, warn};
 use std::sync::Arc;
 
@@ -197,25 +195,6 @@ impl ProcessTracker {
             .context("Failed to add IP rule")
     }
 
-    /// Apply IP rules from a Role definition
-    pub fn apply_ip_rules(&self, role_id: RoleId, rules: &[IpRule]) -> Result<()> {
-        for rule in rules {
-            let direction = match rule.direction.to_lowercase().as_str() {
-                "bind" => DIR_BIND,
-                "connect" => DIR_CONNECT,
-                _ => DIR_CONNECT, // Default to connect for egress control
-            };
-
-            self.add_ip_rule(role_id, &rule.cidr, direction, rule.allow)?;
-
-            info!(
-                "Applied IP rule: role={} cidr={} direction={} allow={}",
-                role_id.0, rule.cidr, rule.direction, rule.allow
-            );
-        }
-        Ok(())
-    }
-
     /// Configure proxy requirement for a role
     pub fn set_proxy_config(&self, role_id: RoleId, config: &ProxyConfig) -> Result<()> {
         self.bpf
@@ -229,18 +208,50 @@ impl ProcessTracker {
             .add_domain_rule(role_id.0, domain, allowed)
             .context("Failed to add domain rule")
     }
+}
 
-    /// Apply domain rules from a Role definition
-    pub fn apply_domain_rules(&self, role_id: RoleId, rules: &[DomainRule]) -> Result<()> {
-        for rule in rules {
-            self.add_domain_rule(role_id, &rule.domain, rule.allow)?;
+/// Writes role rules through the tracker's BPF handle.
+///
+/// Lets the daemon apply a policy through the same
+/// [`bpfjailer_common::apply::apply_role`] walk the bootstrap uses, so the two
+/// cannot disagree about which sections of a role are honoured.
+pub struct TrackerSink<'a>(pub &'a ProcessTracker);
 
-            info!(
-                "Applied domain rule: role={} domain={} allow={}",
-                role_id.0, rule.domain, rule.allow
-            );
-        }
-        Ok(())
+impl bpfjailer_common::apply::PolicySink for TrackerSink<'_> {
+    type Err = anyhow::Error;
+
+    fn set_role_flags(&mut self, role_id: u32, flags: u8) -> Result<()> {
+        self.0.bpf.update_role_flags(role_id, flags)
+    }
+    fn add_path_state(&mut self, role_id: u32, pattern: &str, allow: bool) -> Result<()> {
+        self.0.bpf.add_path_state(role_id, pattern, allow)
+    }
+    fn add_network_rule(
+        &mut self,
+        role_id: u32,
+        port: u16,
+        protocol: u8,
+        direction: u8,
+        allow: bool,
+    ) -> Result<()> {
+        self.0
+            .bpf
+            .add_network_rule(role_id, port, protocol, direction, allow)
+    }
+    fn add_ip_rule(&mut self, role_id: u32, cidr: &str, direction: u8, allow: bool) -> Result<()> {
+        self.0.add_ip_rule(RoleId(role_id), cidr, direction, allow)
+    }
+    fn add_domain_rule(&mut self, role_id: u32, domain: &str, allow: bool) -> Result<()> {
+        self.0.add_domain_rule(RoleId(role_id), domain, allow)
+    }
+    fn set_proxy(&mut self, role_id: u32, address: &str, required: bool) -> Result<()> {
+        self.0.set_proxy_config(
+            RoleId(role_id),
+            &ProxyConfig {
+                address: address.to_string(),
+                required,
+            },
+        )
     }
 }
 

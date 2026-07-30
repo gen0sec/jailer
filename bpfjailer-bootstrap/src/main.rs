@@ -4,7 +4,7 @@
 //! After setup, exits immediately. Programs remain active until reboot.
 
 use anyhow::{Context, Result};
-use bpfjailer_common::apply::{apply_role, PolicySink};
+use bpfjailer_common::apply::{apply_role, PolicySink, SystemResolver};
 use bpfjailer_common::codec;
 use bpfjailer_common::policy::PolicyConfig;
 use libbpf_rs::MapCore;
@@ -248,6 +248,20 @@ impl PolicySink for ObjectSink<'_> {
         Ok(())
     }
 
+    fn cache_resolved_ip(
+        &mut self,
+        role_id: u32,
+        ip: std::net::Ipv4Addr,
+        domain_hash: u64,
+    ) -> Result<()> {
+        self.map("dns_cache")?.update(
+            &codec::dns_cache_key(role_id, ip),
+            &codec::dns_cache_value(domain_hash, 0),
+            MapFlags::empty(),
+        )?;
+        Ok(())
+    }
+
     fn set_proxy(&mut self, role_id: u32, address: &str, required: bool) -> Result<()> {
         let (ip, port) = codec::parse_proxy_addr(address).map_err(|e| anyhow::anyhow!(e))?;
         self.map("proxy_config")?.update(
@@ -268,7 +282,7 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
     // domain_rules and proxy entirely.
     for (name, role) in &policy.roles {
         let mut sink = ObjectSink { object };
-        let skipped = apply_role(&mut sink, role)?;
+        let skipped = apply_role(&mut sink, role, &SystemResolver)?;
         for s in skipped {
             log::warn!("Role '{}': skipped {}", name, s);
         }

@@ -89,7 +89,11 @@ async fn main() -> Result<()> {
         let pm = policy_manager.read().await;
         for (name, role) in &pm.config().roles {
             let mut sink = process_tracker::TrackerSink(&process_tracker);
-            match bpfjailer_common::apply::apply_role(&mut sink, role) {
+            match bpfjailer_common::apply::apply_role(
+                &mut sink,
+                role,
+                &bpfjailer_common::apply::SystemResolver,
+            ) {
                 Ok(skipped) => {
                     for s in skipped {
                         warn!("Role '{}': skipped {}", name, s);

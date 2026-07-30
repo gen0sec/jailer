@@ -617,3 +617,183 @@ mod network_rule_tests {
         assert_eq!(ports, vec![80]);
     }
 }
+
+/// `struct dns_cache_key { u32 role_id; u32 ip_addr; }`
+///
+/// `ip_addr` is network byte order, matching `sin_addr.s_addr` as BPF reads it.
+pub fn dns_cache_key(role_id: u32, ip: Ipv4Addr) -> [u8; 8] {
+    let mut k = [0u8; 8];
+    k[0..4].copy_from_slice(&role_id.to_ne_bytes());
+    k[4..8].copy_from_slice(&ip.octets());
+    k
+}
+
+/// `struct dns_cache_value { u64 domain_hash; u64 timestamp; }`
+///
+/// `timestamp` is written but not yet consulted: nothing expires entries, so a
+/// stale address stays associated with its name until the next policy load.
+pub fn dns_cache_value(domain_hash: u64, timestamp: u64) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    v[0..8].copy_from_slice(&domain_hash.to_ne_bytes());
+    v[8..16].copy_from_slice(&timestamp.to_ne_bytes());
+    v
+}
+
+#[cfg(test)]
+mod dns_cache_tests {
+    use super::*;
+
+    #[test]
+    fn dns_cache_key_layout() {
+        let k = dns_cache_key(9, "93.184.216.34".parse().unwrap());
+        assert_eq!(u32::from_ne_bytes(k[0..4].try_into().unwrap()), 9);
+        assert_eq!(&k[4..8], &[93, 184, 216, 34], "network byte order");
+    }
+
+    #[test]
+    fn dns_cache_value_layout() {
+        let v = dns_cache_value(0xAABB_CCDD_1122_3344, 42);
+        assert_eq!(
+            u64::from_ne_bytes(v[0..8].try_into().unwrap()),
+            0xAABB_CCDD_1122_3344
+        );
+        assert_eq!(u64::from_ne_bytes(v[8..16].try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn different_roles_do_not_share_a_cache_entry() {
+        let ip: Ipv4Addr = "1.2.3.4".parse().unwrap();
+        assert_ne!(dns_cache_key(1, ip), dns_cache_key(2, ip));
+    }
+}
+
+/// A BPF hash lookup compares the *whole* key, padding included. A key struct
+/// built with an initializer list leaves its padding as whatever the stack
+/// held, so such a lookup matches only when that happens to be zero.
+///
+/// This cost us a domain rule that enforced roughly one connect in three: the
+/// unpadded `dns_cache_key` hit every time while the padded `domain_rule_key`
+/// beside it missed at random. These tests fail if a padded key is ever
+/// initialized that way again.
+#[cfg(test)]
+mod bpf_key_padding {
+    const SRC: &str = include_str!("../../bpfjailer-bpf/src/main.bpf.c");
+
+    fn width(ty: &str) -> Option<usize> {
+        match ty {
+            "u8" | "s8" | "char" => Some(1),
+            "u16" | "s16" | "__be16" => Some(2),
+            "u32" | "s32" | "__be32" => Some(4),
+            "u64" | "s64" => Some(8),
+            _ => None,
+        }
+    }
+
+    /// Every `struct *key* { .. }` in the BPF source, paired with whether the
+    /// C layout rules insert padding into it.
+    fn key_structs() -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        for (idx, _) in SRC.match_indices("struct ") {
+            let rest = &SRC[idx + "struct ".len()..];
+            let Some(brace) = rest.find('{') else {
+                continue;
+            };
+            let name = rest[..brace].trim();
+            if !name.contains("key") || name.contains(char::is_whitespace) {
+                continue;
+            }
+            let Some(end) = rest.find('}') else { continue };
+            if end < brace {
+                continue;
+            }
+
+            // Strip trailing `//` comments first. Splitting on `;` while they
+            // are present pushes the *next* field into a segment that begins
+            // with the comment, and dropping that segment loses a real field.
+            let body: String = rest[brace + 1..end]
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut offset = 0usize;
+            let mut widest = 1usize;
+            let mut padded = false;
+            let mut parsed_all = true;
+            for field in body.split(';') {
+                let field = field.trim();
+                if field.is_empty() {
+                    continue;
+                }
+                let mut parts = field.split_whitespace();
+                let (Some(ty), Some(decl)) = (parts.next(), parts.next()) else {
+                    continue;
+                };
+                let Some(w) = width(ty) else {
+                    parsed_all = false;
+                    break;
+                };
+                // arrays: `u8 name[4]`
+                let count = decl
+                    .split_once('[')
+                    .and_then(|(_, n)| n.trim_end_matches(']').parse::<usize>().ok())
+                    .unwrap_or(1);
+                if !offset.is_multiple_of(w) {
+                    padded = true;
+                    offset += w - offset % w;
+                }
+                offset += w * count;
+                widest = widest.max(w);
+            }
+            if parsed_all {
+                if !offset.is_multiple_of(widest) {
+                    padded = true;
+                }
+                out.push((name.to_string(), padded));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_source_still_contains_key_structs_to_check() {
+        let keys = key_structs();
+        assert!(
+            keys.len() >= 5,
+            "expected to parse several key structs, found {keys:?} -- the parser has \
+             probably drifted from the source and is silently checking nothing"
+        );
+        assert!(
+            keys.iter().any(|(_, padded)| *padded),
+            "expected at least one padded key; if the layouts genuinely changed so that \
+             none are padded, this guard can go, but verify that before deleting it"
+        );
+    }
+
+    #[test]
+    fn no_padded_key_is_built_with_an_initializer_list() {
+        let offenders: Vec<_> = key_structs()
+            .into_iter()
+            .filter(|(_, padded)| *padded)
+            .map(|(name, _)| name)
+            .filter(|name| SRC.contains(&format!("struct {name} ")))
+            .filter(|name| {
+                // `struct <name> <var> = {` anywhere means the padding is
+                // indeterminate. Zeroing via __builtin_memset is the fix.
+                SRC.match_indices(&format!("struct {name} ")).any(|(i, _)| {
+                    let tail = &SRC[i..];
+                    let line_end = tail.find('\n').unwrap_or(tail.len());
+                    tail[..line_end].contains("= {")
+                })
+            })
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "these padded key structs are built with an initializer list, so their \
+             padding is whatever the stack held and map lookups will match only \
+             intermittently: {offenders:?}. Declare them, __builtin_memset(&k, 0, \
+             sizeof(k)), then assign the fields."
+        );
+    }
+}

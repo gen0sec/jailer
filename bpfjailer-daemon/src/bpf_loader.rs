@@ -250,6 +250,25 @@ impl BpfJailerBpf {
         Ok(result)
     }
 
+    /// Associate a resolved address with the domain it came from, so
+    /// `check_domain_access` can map a connect target back to a name.
+    pub fn cache_resolved_ip(
+        &self,
+        role_id: u32,
+        ip: std::net::Ipv4Addr,
+        domain_hash: u64,
+    ) -> Result<()> {
+        let object = self.object.lock().unwrap();
+        let map = map_by_name(&object, "dns_cache")
+            .ok_or_else(|| anyhow::anyhow!("dns_cache map not found"))?;
+        map.update(
+            &codec::dns_cache_key(role_id, ip),
+            &codec::dns_cache_value(domain_hash, 0),
+            MapFlags::empty(),
+        )?;
+        Ok(())
+    }
+
     pub fn update_pod_role(&self, pod_id: u64, role_id: u32) -> Result<()> {
         let object = self.object.lock().unwrap();
         let map = map_by_name(&object, "pod_to_role")

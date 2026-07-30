@@ -244,6 +244,15 @@ impl bpfjailer_common::apply::PolicySink for TrackerSink<'_> {
     fn add_domain_rule(&mut self, role_id: u32, domain: &str, allow: bool) -> Result<()> {
         self.0.add_domain_rule(RoleId(role_id), domain, allow)
     }
+    fn cache_resolved_ip(
+        &mut self,
+        role_id: u32,
+        ip: std::net::Ipv4Addr,
+        domain_hash: u64,
+    ) -> Result<()> {
+        self.0.bpf.cache_resolved_ip(role_id, ip, domain_hash)
+    }
+
     fn set_proxy(&mut self, role_id: u32, address: &str, required: bool) -> Result<()> {
         self.0.set_proxy_config(
             RoleId(role_id),

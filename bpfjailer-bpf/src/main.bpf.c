@@ -224,7 +224,10 @@ struct {
     __type(value, u8);
 } domain_rules SEC(".maps");
 
-// DNS cache: maps resolved IP -> domain hash (populated by DNS interception)
+// Resolved-address table: maps a resolved IP -> the hash of the name it came
+// from. Populated at policy load, not by DNS interception, so entries must
+// survive for the lifetime of the policy: a plain HASH, never an LRU_HASH.
+// An LRU here silently evicts policy state and the domain rule stops biting.
 struct dns_cache_key {
     u32 role_id;
     u32 ip_addr;      // Resolved IP address
@@ -236,7 +239,7 @@ struct dns_cache_value {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 8192);
     __type(key, struct dns_cache_key);
     __type(value, struct dns_cache_value);
@@ -405,11 +408,14 @@ static __always_inline int check_path_state_machine(u32 role_id, struct path_com
         return 0;  // No rule
 
     u32 state = PATH_STATE_ROOT;
-    struct path_state_key key = {
-        .role_id = role_id,
-        .state = 0,
-        .component_hash = 0,
-    };
+    // Zeroed explicitly: the struct has 4 bytes of padding before .state, and
+    // a BPF hash lookup compares the whole key. An initializer list leaves that
+    // padding as whatever the stack held, so lookups match only by luck.
+    struct path_state_key key;
+    __builtin_memset(&key, 0, sizeof(key));
+    key.role_id = role_id;
+    key.state = 0;
+    key.component_hash = 0;
 
     u8 count = buf->count;
     if (count > MAX_COMPONENTS)
@@ -549,10 +555,11 @@ int BPF_PROG(file_open, struct file *file)
         struct inode *inode = BPF_CORE_READ(dentry, d_inode);
 
         if (inode) {
-            struct inode_cache_key cache_key = {
-                .role_id = info->role_id,
-                .inode = (u64)inode,
-            };
+            // Zeroed explicitly: padded key, see path_state_key above.
+            struct inode_cache_key cache_key;
+            __builtin_memset(&cache_key, 0, sizeof(cache_key));
+            cache_key.role_id = info->role_id;
+            cache_key.inode = (u64)inode;
             struct inode_cache_value *cached = bpf_map_lookup_elem(&inode_cache, &cache_key);
             if (cached && cached->generation == current_gen) {
                 // Cache hit with valid generation
@@ -577,10 +584,11 @@ int BPF_PROG(file_open, struct file *file)
             if (result != 0) {
                 // Cache the decision with current generation
                 if (inode) {
-                    struct inode_cache_key cache_key = {
-                        .role_id = info->role_id,
-                        .inode = (u64)inode,
-                    };
+                    // Zeroed explicitly: padded key, see path_state_key above.
+                    struct inode_cache_key cache_key;
+                    __builtin_memset(&cache_key, 0, sizeof(cache_key));
+                    cache_key.role_id = info->role_id;
+                    cache_key.inode = (u64)inode;
                     struct inode_cache_value val = {
                         .decision = (result == 1) ? 1 : 0,
                         .generation = current_gen,
@@ -703,6 +711,46 @@ static __always_inline int is_proxy_connection(u32 role_id, u32 ip_addr, u16 por
 
 // Check proxy enforcement
 // Returns: 0 = allowed, -13 = blocked (not going through proxy)
+// Resolve a destination IP back to the domain it was resolved from, then
+// consult that role's domain rules.
+//
+// dns_cache is populated by userspace: at policy load each domain in a role's
+// domain_rules is resolved and every returned address recorded. BPF cannot
+// parse DNS itself -- the verifier will not accept it -- so this is name
+// filtering approximated by address, with the limits that implies:
+//
+//   * an address that changes after load is not covered until the next refresh
+//   * a host serving several names shares one entry, last writer wins
+//   * a process that resolves a name itself and connects to some other address
+//     is not caught, because nothing here observes the resolution
+//
+// Returns 1 to allow, -13 to deny, 0 when the address is unknown to us and the
+// decision belongs to the rules that follow.
+static __always_inline int check_domain_access(u32 role_id, u32 ip_addr)
+{
+    if (ip_addr == 0)
+        return 0;
+
+    struct dns_cache_key ck = {
+        .role_id = role_id,
+        .ip_addr = ip_addr,
+    };
+    struct dns_cache_value *cached = bpf_map_lookup_elem(&dns_cache, &ck);
+    if (!cached)
+        return 0;  // address not associated with any name we were told about
+
+    // Zeroed explicitly: padded key, see path_state_key above.
+    struct domain_rule_key dk;
+    __builtin_memset(&dk, 0, sizeof(dk));
+    dk.role_id = role_id;
+    dk.domain_hash = cached->domain_hash;
+    u8 *allow = bpf_map_lookup_elem(&domain_rules, &dk);
+    if (!allow)
+        return 0;  // name known, but this role has no rule for it
+
+    return *allow ? 1 : -13;
+}
+
 static __always_inline int check_proxy_requirement(u32 role_id, u32 ip_addr, u16 port)
 {
     struct proxy_config *config = bpf_map_lookup_elem(&proxy_config, &role_id);
@@ -868,7 +916,6 @@ int BPF_PROG(socket_connect, struct socket *sock, struct sockaddr *address, int 
         bpf_probe_read_kernel(&be_port, sizeof(be_port), &addr6->sin6_port);
         dest_port = bpf_ntohs(be_port);
     }
-
     // Check proxy requirement first (if configured)
     if (dest_ip != 0) {
         int proxy_result = check_proxy_requirement(info->role_id, dest_ip, dest_port);
@@ -876,6 +923,20 @@ int BPF_PROG(socket_connect, struct socket *sock, struct sockaddr *address, int 
             emit_audit_event(ctx, pid, info->role_id, info->pod_id,
                              AUDIT_DECISION_DENY, AUDIT_HOOK_SOCKET_CONNECT, dest_ip);
             return -13;  // Blocked: not going through required proxy
+        }
+    }
+
+    // Check domain rules first: they are the most specific statement of intent
+    // the operator can make about an egress destination.
+    if (dest_ip != 0) {
+        int domain_result = check_domain_access(info->role_id, dest_ip);
+        if (domain_result == -13) {
+            emit_audit_event(ctx, pid, info->role_id, info->pod_id,
+                             AUDIT_DECISION_DENY, AUDIT_HOOK_SOCKET_CONNECT, dest_ip);
+            return -13;
+        }
+        if (domain_result == 1) {
+            return 0;
         }
     }
 
@@ -1135,8 +1196,9 @@ int BPF_PROG(bpf, int cmd, union bpf_attr *attr, unsigned int size)
 // =============================================================================
 // DNS Interception for Domain-based Filtering (Simplified)
 // =============================================================================
-// Note: Full DNS parsing is too complex for BPF verifier.
-// Domain filtering is handled at IP level via dns_cache populated by userspace.
+// Note: Full DNS parsing is too complex for BPF verifier, so domain
+// filtering is done at IP level in check_domain_access() above, against a
+// dns_cache that userspace populates by resolving each policy domain.
 
 #define DNS_PORT 53
 #define AUDIT_HOOK_DNS_QUERY 6

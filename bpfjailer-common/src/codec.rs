@@ -207,7 +207,9 @@ pub fn parse_proxy_addr(addr: &str) -> Result<(Ipv4Addr, u16), String> {
 /// `struct proxy_config { u32 proxy_ip; u16 proxy_port; u8 require_proxy; u8 _pad; }`
 pub fn proxy_config_value(ip: Ipv4Addr, port: u16, required: bool) -> [u8; 8] {
     let mut v = [0u8; 8];
-    v[0..4].copy_from_slice(&u32::from_be_bytes(ip.octets()).to_ne_bytes());
+    // Network byte order, matching ip_rule_key and dns_cache_key: the BPF side
+    // compares this against sin_addr.s_addr as it read it, without conversion.
+    v[0..4].copy_from_slice(&ip.octets());
     v[4..6].copy_from_slice(&port.to_ne_bytes());
     v[6] = required as u8;
     v
@@ -488,8 +490,13 @@ mod tests {
 
     #[test]
     fn proxy_config_value_layout() {
-        let v = proxy_config_value("127.0.0.1".parse().unwrap(), 8080, true);
-        assert_eq!(le32(&v[0..4]), u32::from_be_bytes([127, 0, 0, 1]));
+        // Not 127.0.0.1: the BPF side allows loopback unconditionally, so an
+        // address in that range cannot distinguish a correct encoding from a
+        // reversed one. This previously asserted the address by reading it back
+        // through the same convention the encoder used, which made it agree with
+        // itself while disagreeing with the kernel.
+        let v = proxy_config_value("10.0.2.3".parse().unwrap(), 8080, true);
+        assert_eq!(&v[0..4], &[10, 0, 2, 3], "network byte order");
         assert_eq!(u16::from_ne_bytes([v[4], v[5]]), 8080);
         assert_eq!(v[6], 1);
         assert_eq!(v[7], 0);
@@ -671,6 +678,54 @@ mod dns_cache_tests {
 /// only in the BPF program. It exists because the encoder side had no coverage
 /// of what a rule set actually decides, which is how an inert allow-list went
 /// unnoticed.
+/// Every map that holds an IPv4 address is compared against a value the kernel
+/// read straight out of `sin_addr.s_addr`, which is network byte order. An
+/// encoder that stores the address any other way produces a key that can never
+/// match, and the failure is silent.
+#[cfg(test)]
+mod address_encoding_agrees {
+    use super::*;
+
+    const IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
+
+    /// What the BPF side sees: the four bytes of the address, in order.
+    fn as_the_kernel_reads_it() -> [u8; 4] {
+        IP.octets()
+    }
+
+    #[test]
+    fn the_proxy_address_is_stored_as_the_kernel_reads_it() {
+        let v = proxy_config_value(IP, 8080, true);
+        assert_eq!(
+            &v[0..4],
+            &as_the_kernel_reads_it(),
+            "proxy_config.proxy_ip is compared against sin_addr.s_addr, so it must              hold the address in network byte order; reversing it means a connect to              the proxy itself never matches and require_proxy blocks everything"
+        );
+    }
+
+    #[test]
+    fn every_encoder_stores_an_address_identically() {
+        let ip_rule = ip_rule_key(1, IP, 32, 1);
+        let dns = dns_cache_key(1, IP);
+        let proxy = proxy_config_value(IP, 8080, true);
+
+        assert_eq!(&ip_rule[4..8], &as_the_kernel_reads_it(), "ip_rule_key");
+        assert_eq!(&dns[4..8], &as_the_kernel_reads_it(), "dns_cache_key");
+        assert_eq!(
+            &proxy[0..4],
+            &as_the_kernel_reads_it(),
+            "proxy_config_value"
+        );
+    }
+
+    #[test]
+    fn the_port_is_stored_in_host_order_because_the_kernel_converts_it_first() {
+        // socket_connect does dest_port = bpf_ntohs(be_port) before comparing.
+        let v = proxy_config_value(IP, 8080, true);
+        assert_eq!(u16::from_ne_bytes([v[4], v[5]]), 8080);
+    }
+}
+
 #[cfg(test)]
 mod path_walk_semantics {
     use super::*;

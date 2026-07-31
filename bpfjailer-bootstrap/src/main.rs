@@ -290,14 +290,6 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
     }
 
     // Load pod mappings
-    if let Some(map) = map_by_name(object, "pod_to_role") {
-        for pod in &policy.pods {
-            let key = pod.id.to_ne_bytes();
-            let value = pod.role_id.0.to_ne_bytes();
-            map.update(&key, &value, MapFlags::empty())?;
-            log::info!("Pod {} -> role {}", pod.id, pod.role_id.0);
-        }
-    }
 
     // Load exec enrollments
     if let Some(map) = map_by_name(object, "exec_enrollment") {
@@ -376,7 +368,6 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
     // Pin all maps
     let map_names = [
         "task_storage",
-        "pod_to_role",
         "role_flags",
         "pending_enrollments",
         "network_rules",
@@ -579,22 +570,6 @@ mod root_integration {
                 .expect("transition present");
             assert_eq!(got.as_slice(), value.as_slice());
         }
-    }
-
-    #[test]
-    #[ignore = "requires root"]
-    fn populate_maps_writes_pod_to_role() {
-        let Some(mut object) = loaded_object() else {
-            return;
-        };
-        let cfg: PolicyConfig = serde_json::from_str(POLICY).expect("parse");
-        populate_maps(&mut object, &cfg).expect("populate");
-        let v = map_by_name(&object, "pod_to_role")
-            .expect("map")
-            .lookup(&300u64.to_ne_bytes(), MapFlags::empty())
-            .expect("lookup")
-            .expect("pod present");
-        assert_eq!(u32::from_ne_bytes(v[0..4].try_into().unwrap()), 30);
     }
 
     #[test]

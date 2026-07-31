@@ -28,11 +28,6 @@ impl ProcessTracker {
             pid, pod_id.0, role_id.0
         );
 
-        // Update pod_to_role mapping
-        self.bpf
-            .update_pod_role(pod_id.0, role_id.0)
-            .context("Failed to insert pod_to_role mapping")?;
-
         // Add to pending_enrollments map - BPF will migrate to task_storage
         // on the next syscall (file_open, exec, etc.)
         self.bpf

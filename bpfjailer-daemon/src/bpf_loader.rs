@@ -97,9 +97,6 @@ impl BpfJailerBpf {
         log::info!("BPF object loaded successfully");
 
         // Check that maps exist
-        if map_by_name(&object, "pod_to_role").is_none() {
-            return Err(anyhow::anyhow!("pod_to_role map not found"));
-        }
         if map_by_name(&object, "role_flags").is_none() {
             return Err(anyhow::anyhow!("role_flags map not found"));
         }
@@ -261,16 +258,6 @@ impl BpfJailerBpf {
             &codec::dns_cache_value(domain_hash, 0),
             MapFlags::empty(),
         )?;
-        Ok(())
-    }
-
-    pub fn update_pod_role(&self, pod_id: u64, role_id: u32) -> Result<()> {
-        let object = self.object.lock().unwrap();
-        let map = map_by_name(&object, "pod_to_role")
-            .ok_or_else(|| anyhow::anyhow!("pod_to_role map not found"))?;
-        let key = pod_id.to_ne_bytes();
-        let value = role_id.to_ne_bytes();
-        map.update(&key, &value, MapFlags::empty())?;
         Ok(())
     }
 
@@ -677,7 +664,6 @@ impl BpfJailerBpf {
         // Pin maps
         let map_names = [
             "task_storage",
-            "pod_to_role",
             "role_flags",
             "pending_enrollments",
             "network_rules",
@@ -812,7 +798,6 @@ mod root_integration {
         let b = bpf_or_skip!();
         let object = b.object.lock().unwrap();
         for name in [
-            "pod_to_role",
             "role_flags",
             "pending_enrollments",
             "network_rules",
@@ -827,15 +812,6 @@ mod root_integration {
         ] {
             assert!(map_by_name(&object, name).is_some(), "map {name} missing");
         }
-    }
-
-    #[test]
-    #[ignore = "requires root"]
-    fn pod_role_round_trips() {
-        let b = bpf_or_skip!();
-        b.update_pod_role(4242, 7).expect("update");
-        let v = lookup(&b, "pod_to_role", &4242u64.to_ne_bytes()).expect("entry present");
-        assert_eq!(u32::from_ne_bytes(v[0..4].try_into().unwrap()), 7);
     }
 
     #[test]

@@ -324,6 +324,11 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
         for enrollment in &policy.cgroup_enrollments {
             if let Ok(metadata) = fs::metadata(&enrollment.cgroup_path) {
                 let cgroup_id = metadata.ino();
+                if let Err(reason) =
+                    bpfjailer_common::cgroup::check_enrollable(&enrollment.cgroup_path, cgroup_id)
+                {
+                    return Err(anyhow::anyhow!("cgroup enrollment refused: {reason}"));
+                }
                 if let Some(role) = policy.get_role(&enrollment.role) {
                     let key = cgroup_id.to_ne_bytes();
                     let mut value = [0u8; 16];

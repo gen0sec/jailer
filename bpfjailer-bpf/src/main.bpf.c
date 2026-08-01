@@ -152,6 +152,12 @@ struct {
     __type(value, struct exec_enrollment_value);
 } cgroup_enrollment SEC(".maps");
 
+// How far up the cgroup tree an enrollment is looked for. A kubelet nests
+// containers four deep (kubepods.slice / qos.slice / pod.slice / container
+// .scope); eight leaves room for deeper systemd nesting without unrolling a
+// loop the verifier has to walk on every exec.
+#define MAX_CGROUP_DEPTH 8
+
 // =============================================================================
 // IP/CIDR Egress Filtering
 // =============================================================================
@@ -1002,8 +1008,33 @@ int BPF_PROG(bprm_check_security, struct linux_binprm *bprm)
 
     // If still not enrolled, check for auto-enrollment by cgroup
     if (info->pod_id == 0) {
+        // Match the task's own cgroup first, then walk its ancestry, so an
+        // enrollment covers a cgroup and everything beneath it.
+        //
+        // Without this only the leaf matches. Under a kubelet the leaf is the
+        // container scope, whose name carries the container id, so a policy
+        // could only name an object that is replaced on every restart and
+        // enforcement lapsed silently on any rollout. Ancestor matching lets a
+        // policy name a stable cgroup -- a pod slice, or kubepods.slice, which
+        // exists before any pod is scheduled.
+        //
+        // Deepest first, so a container-scope rule still beats a pod rule and a
+        // pod rule still beats a node-wide one. Level 0 is the cgroup root and
+        // is deliberately not consulted: it is every process on the host, and
+        // the loader refuses to enroll it.
         u64 cgroup_id = bpf_get_current_cgroup_id();
         struct exec_enrollment_value *enroll = bpf_map_lookup_elem(&cgroup_enrollment, &cgroup_id);
+
+        #pragma unroll
+        for (int lvl = MAX_CGROUP_DEPTH; lvl > 0; lvl--) {
+            if (enroll)
+                break;
+            // Returns 0 when the task's cgroup is shallower than this level.
+            u64 ancestor_id = bpf_get_current_ancestor_cgroup_id(lvl);
+            if (ancestor_id)
+                enroll = bpf_map_lookup_elem(&cgroup_enrollment, &ancestor_id);
+        }
+
         if (enroll) {
             // Auto-enroll based on cgroup
             info->pod_id = enroll->pod_id;

@@ -85,6 +85,22 @@ mod map_has_a_bpf_side_reader {
         without_comments(SOURCE)
     }
 
+    /// Enrollment matches `bpf_get_current_cgroup_id()`, the task's *leaf*
+    /// cgroup. Under a kubelet the leaf is the container scope, whose name
+    /// carries the container id, so a policy could only ever name an object
+    /// that is replaced on every restart -- enforcement silently lapsed on any
+    /// rollout. Matching ancestors as well is what lets a policy name a stable
+    /// cgroup such as `kubepods.slice`.
+    #[test]
+    fn the_exec_hook_matches_ancestor_cgroups_not_only_the_leaf() {
+        let body = stripped();
+        assert!(
+            body.contains("bpf_get_current_ancestor_cgroup_id"),
+            "nothing walks the cgroup ancestry, so only the leaf cgroup can be \
+             enrolled and enrollment cannot survive a container restart"
+        );
+    }
+
     #[test]
     fn the_parser_still_finds_the_maps() {
         let body = stripped();

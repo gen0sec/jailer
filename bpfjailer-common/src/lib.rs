@@ -1,5 +1,6 @@
 pub mod apply;
 mod bpf_contract;
+pub mod cgroup;
 pub mod codec;
 pub mod flags;
 pub mod hash;

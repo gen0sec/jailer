@@ -9,6 +9,36 @@
 //!
 //! Nothing links the two halves, so the tests here assert the link directly.
 
+/// The bootstrap and the daemon each search for the compiled object
+/// independently. They disagreed: the bootstrap looked in the installed
+/// locations and the daemon only in cargo build trees, so a packaged daemon
+/// could not start at all while the bootstrap on the same host worked.
+#[cfg(test)]
+mod loaders_agree_on_installed_paths {
+    const BOOTSTRAP: &str = include_str!("../../bpfjailer-bootstrap/src/main.rs");
+    const DAEMON: &str = include_str!("../../bpfjailer-daemon/src/bpf_loader.rs");
+
+    const INSTALLED: [&str; 2] = [
+        "/usr/lib/bpfjailer/bpfjailer.bpf.o",
+        "/usr/share/bpfjailer/bpfjailer.bpf.o",
+    ];
+
+    #[test]
+    fn both_loaders_search_the_installed_locations() {
+        for path in INSTALLED {
+            assert!(
+                BOOTSTRAP.contains(path),
+                "the bootstrap no longer looks in {path}"
+            );
+            assert!(
+                DAEMON.contains(path),
+                "the daemon does not look in {path}, so it cannot start from an \
+                 installed package even where the bootstrap can"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod map_has_a_bpf_side_reader {
     /// `bpfjailer-bpf/build.rs` lists five `.bpf.c` files for

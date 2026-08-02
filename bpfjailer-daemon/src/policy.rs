@@ -113,6 +113,21 @@ impl PolicyManager {
         self.role_map.get(&role_id)
     }
 
+    /// Install a role at runtime.
+    ///
+    /// Roles otherwise only exist if they were in the policy file this daemon
+    /// started with, so anything deciding policy dynamically -- a controller
+    /// synthesising a role from label selectors, say -- could enroll a cgroup
+    /// only against a role someone had already written down by hand.
+    ///
+    /// Replacing an existing id is deliberate: a role's contents change when
+    /// the policy behind it changes, while its id is derived from that policy
+    /// and stays put.
+    pub fn define_role(&mut self, role: Role) {
+        self.config.roles.insert(role.name.clone(), role.clone());
+        self.role_map.insert(role.id, Arc::new(role));
+    }
+
     #[allow(dead_code)]
     pub fn get_role_by_name(&self, name: &str) -> Option<&Arc<Role>> {
         self.config

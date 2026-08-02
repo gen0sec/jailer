@@ -45,6 +45,11 @@ impl BpfJailerBpf {
             .unwrap_or_else(|| PathBuf::from("."));
 
         let possible_paths = [
+            // Installed locations first, and searched at all: without them the
+            // daemon only ever found the object inside a cargo build tree, so
+            // it could not run from a package the way the bootstrap can.
+            PathBuf::from("/usr/lib/bpfjailer/bpfjailer.bpf.o"),
+            PathBuf::from("/usr/share/bpfjailer/bpfjailer.bpf.o"),
             workspace_root.join("target/bpfel-unknown-none/release/bpfjailer.bpf.o"),
             workspace_root.join("target/bpfel-unknown-none/debug/bpfjailer.bpf.o"),
             workspace_root.join("bpfjailer-bpf/target/bpfel-unknown-none/release/bpfjailer.bpf.o"),

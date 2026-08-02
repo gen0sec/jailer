@@ -22,6 +22,12 @@ pub enum EnrollmentRequest {
     RemoveExecutable {
         executable_path: String,
     },
+    /// Install or replace a role, so a caller deciding policy at runtime can
+    /// enroll against it. Without this, enrollment can only name roles that
+    /// were in the policy file the daemon started with.
+    DefineRole {
+        role: bpfjailer_common::policy::Role,
+    },
     EnrollCgroup {
         cgroup_path: String,
         pod_id: PodId,

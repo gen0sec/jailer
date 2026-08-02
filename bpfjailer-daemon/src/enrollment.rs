@@ -178,6 +178,32 @@ impl EnrollmentServer {
                     )),
                 }
             }
+            EnrollmentRequest::DefineRole { role } => {
+                info!("Define role request: '{}' (id={})", role.name, role.id.0);
+
+                // Registered before it is applied, so an enrollment naming
+                // this id cannot arrive between the two and be refused as
+                // unknown.
+                policy_manager.write().await.define_role(role.clone());
+
+                // The same walk the daemon runs at startup and the daemonless
+                // bootstrap runs on load, so a role defined at runtime reaches
+                // the maps by exactly the route a file-defined one does.
+                let mut sink = crate::process_tracker::TrackerSink(&process_tracker);
+                match bpfjailer_common::apply::apply_role(
+                    &mut sink,
+                    &role,
+                    &bpfjailer_common::apply::SystemResolver,
+                ) {
+                    Ok(skipped) => {
+                        for s in &skipped {
+                            error!("Role '{}': skipped {}", role.name, s);
+                        }
+                        EnrollmentResponse::Success
+                    }
+                    Err(e) => EnrollmentResponse::Error(format!("Failed to apply role: {}", e)),
+                }
+            }
             EnrollmentRequest::EnrollCgroup {
                 cgroup_path,
                 pod_id,

@@ -181,27 +181,46 @@ impl EnrollmentServer {
             EnrollmentRequest::DefineRole { role } => {
                 info!("Define role request: '{}' (id={})", role.name, role.id.0);
 
-                // Registered before it is applied, so an enrollment naming
-                // this id cannot arrive between the two and be refused as
-                // unknown.
-                policy_manager.write().await.define_role(role.clone());
+                // The same refusal the two file-load paths apply. Without it a
+                // role arriving over IPC could ask for something nothing
+                // enforces -- args_pattern, require_signed_binary -- and be
+                // applied as though it had been honoured, which is exactly what
+                // the file paths refuse to do. Checked BEFORE define_role, so a
+                // rejected role is not left registered.
+                let unenforced = bpfjailer_common::policy::unenforced_settings(&role);
+                if !unenforced.is_empty() {
+                    let msg = format!(
+                        "role '{}' requests {} which this build does not enforce; \
+                         remove the setting or do not rely on it",
+                        role.name,
+                        unenforced.join(", ")
+                    );
+                    error!("{}", msg);
+                    EnrollmentResponse::Error(msg)
+                } else {
+                    // Registered before it is applied, so an enrollment naming
+                    // this id cannot arrive between the two and be refused as
+                    // unknown.
+                    policy_manager.write().await.define_role(role.clone());
 
-                // The same walk the daemon runs at startup and the daemonless
-                // bootstrap runs on load, so a role defined at runtime reaches
-                // the maps by exactly the route a file-defined one does.
-                let mut sink = crate::process_tracker::TrackerSink(&process_tracker);
-                match bpfjailer_common::apply::apply_role(
-                    &mut sink,
-                    &role,
-                    &bpfjailer_common::apply::SystemResolver,
-                ) {
-                    Ok(skipped) => {
-                        for s in &skipped {
-                            error!("Role '{}': skipped {}", role.name, s);
+                    // The same walk the daemon runs at startup and the
+                    // daemonless bootstrap runs on load, so a role defined at
+                    // runtime reaches the maps by exactly the route a
+                    // file-defined one does.
+                    let mut sink = crate::process_tracker::TrackerSink(&process_tracker);
+                    match bpfjailer_common::apply::apply_role(
+                        &mut sink,
+                        &role,
+                        &bpfjailer_common::apply::SystemResolver,
+                    ) {
+                        Ok(skipped) => {
+                            for s in &skipped {
+                                error!("Role '{}': skipped {}", role.name, s);
+                            }
+                            EnrollmentResponse::Success
                         }
-                        EnrollmentResponse::Success
+                        Err(e) => EnrollmentResponse::Error(format!("Failed to apply role: {}", e)),
                     }
-                    Err(e) => EnrollmentResponse::Error(format!("Failed to apply role: {}", e)),
                 }
             }
             EnrollmentRequest::EnrollCgroup {

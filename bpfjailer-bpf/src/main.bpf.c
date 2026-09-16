@@ -285,12 +285,6 @@ struct {
 #define AUDIT_HOOK_PATH_RENAME    5
 
 // Decision types
-// The mode bits that make an exec hand the caller privilege it did not have.
-// vmlinux.h carries no UAPI constants, so these are spelled out; they are
-// fixed by the on-disk inode format and cannot drift.
-#define S_ISUID 0004000
-#define S_ISGID 0002000
-
 #define AUDIT_DECISION_DENY  0
 #define AUDIT_DECISION_ALLOW 1
 
@@ -1231,17 +1225,21 @@ int BPF_PROG(bprm_check_security, struct linux_binprm *bprm)
 
     struct file *exe = BPF_CORE_READ(bprm, file);
 
-    // A setuid or setgid binary hands the caller privilege it did not have.
-    // role_flags bit 0x10 is allow_setuid; a role without it does not get to
-    // gain privilege that way. Checked before the exec rules, because a rule
-    // permitting a path must not also permit escalation through it.
-    if (!(*flags & 0x10) && exe) {
-        umode_t mode = BPF_CORE_READ(exe, f_inode, i_mode);
-        if (mode & (S_ISUID | S_ISGID)) {
-            emit_audit_event(ctx, pid, info->role_id, info->pod_id,
-                             AUDIT_DECISION_DENY, AUDIT_HOOK_BPRM_CHECK, 0);
-            return -13;
-        }
+    // Does this exec hand the caller privilege it did not have? Ask the kernel
+    // rather than the inode.
+    //
+    // bprm->secureexec is set by bprm_fill_uid, which runs before this hook and
+    // has already decided the question properly: it covers file capabilities as
+    // well as the setuid and setgid bits, and it is NOT set when the mount is
+    // MNT_NOSUID or the task is under NO_NEW_PRIVS, where those bits confer
+    // nothing. Reading i_mode instead -- which this did at first -- misses
+    // capabilities entirely, denies execs that gain nothing, and gets setgid
+    // wrong: the kernel requires S_ISGID and S_IXGRP together, since S_ISGID
+    // alone is the mandatory-locking marker.
+    if (!(*flags & 0x10) && BPF_CORE_READ_BITFIELD_PROBED(bprm, secureexec)) {
+        emit_audit_event(ctx, pid, info->role_id, info->pod_id,
+                         AUDIT_DECISION_DENY, AUDIT_HOOK_BPRM_CHECK, 0);
+        return -13;
     }
 
     // Execution rules, walked over the binary's resolved path with the same
@@ -1335,36 +1333,137 @@ int BPF_PROG(sb_umount, struct vfsmount *mnt, int flags)
 
 // Block ptrace/debugging of enrolled processes
 // Flag: 0x20 = allow_ptrace
-// Block an enrolled process changing its credentials.
-// Flag: 0x10 = allow_setuid
+// The non-exec routes to privilege, for a role without allow_setuid (0x10).
 //
-// The bprm hook above refuses to EXEC a setuid binary. This is the other route
-// to the same privilege: a process that already holds the capability calling
-// setuid/setresuid/setfsuid directly. Enforcing only the exec side would make
-// allow_setuid read broader than it behaves, which is the failure this whole
-// flag was stuck in -- it was packed into role_flags and tested nowhere.
+// These hooks fire on every credential transition, in BOTH directions. The
+// first version of this denied all of them, which blocks privilege DROP: the
+// standard setgroups(0) / setgid / setuid sequence a daemon runs to hand itself
+// to a service user would fail, and the workload stays at uid 0 -- the opposite
+// of what a flag named allow_setuid is for. Every gate below compares the
+// credentials being installed against the ones being replaced, and refuses only
+// a transition that gains something.
+
+// An id moving toward 0 is a gain; moving away is a drop.
+static __always_inline bool uids_gain(const struct cred *new, const struct cred *old)
+{
+    return BPF_CORE_READ(new, uid.val)   < BPF_CORE_READ(old, uid.val)  ||
+           BPF_CORE_READ(new, euid.val)  < BPF_CORE_READ(old, euid.val) ||
+           BPF_CORE_READ(new, suid.val)  < BPF_CORE_READ(old, suid.val) ||
+           BPF_CORE_READ(new, fsuid.val) < BPF_CORE_READ(old, fsuid.val);
+}
+
+static __always_inline bool gids_gain(const struct cred *new, const struct cred *old)
+{
+    return BPF_CORE_READ(new, gid.val)   < BPF_CORE_READ(old, gid.val)  ||
+           BPF_CORE_READ(new, egid.val)  < BPF_CORE_READ(old, egid.val) ||
+           BPF_CORE_READ(new, sgid.val)  < BPF_CORE_READ(old, sgid.val) ||
+           BPF_CORE_READ(new, fsgid.val) < BPF_CORE_READ(old, fsgid.val);
+}
+
+// A capability set gains if it holds any bit the old set did not.
+static __always_inline bool caps_gain(const struct cred *new, const struct cred *old)
+{
+    return (BPF_CORE_READ(new, cap_permitted.val)   & ~BPF_CORE_READ(old, cap_permitted.val))   ||
+           (BPF_CORE_READ(new, cap_effective.val)   & ~BPF_CORE_READ(old, cap_effective.val))   ||
+           (BPF_CORE_READ(new, cap_inheritable.val) & ~BPF_CORE_READ(old, cap_inheritable.val)) ||
+           (BPF_CORE_READ(new, cap_ambient.val)     & ~BPF_CORE_READ(old, cap_ambient.val));
+}
+
+// The enrolled role for the current task, or NULL.
+//
+// Migrates a pending enrollment first. Without that, a process enrolled over
+// IPC since its last open or exec is invisible here -- task_alloc has already
+// created storage with pod_id 0 -- and the hooks whose whole purpose is closing
+// the non-exec route would wave it through.
+static __always_inline struct process_info *enrolled_role_flags(u32 pid, u8 **flags_out)
+{
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+    check_pending_enrollment(task, pid);
+
+    struct process_info *info = bpf_task_storage_get(&task_storage, task, NULL, 0);
+    if (!info || info->pod_id == 0)
+        return NULL;
+
+    *flags_out = bpf_map_lookup_elem(&role_flags, &info->role_id);
+    return info;
+}
+
 SEC("lsm/task_fix_setuid")
 int BPF_PROG(task_fix_setuid, struct cred *new, const struct cred *old, int flags_arg)
 {
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-    struct process_info *info = bpf_task_storage_get(&task_storage, task, NULL, 0);
-
-    if (!info || info->pod_id == 0) {
-        return 0;  // Not enrolled, not ours to police
-    }
-
-    u8 *flags = bpf_map_lookup_elem(&role_flags, &info->role_id);
-    if (!flags) {
-        return -1;
-    }
-
-    if (!(*flags & 0x10)) {
-        u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u8 *flags = NULL;
+    struct process_info *info = enrolled_role_flags(pid, &flags);
+    if (!info)
+        return 0;
+    if (!flags || (!(*flags & 0x10) && uids_gain(new, old))) {
         emit_audit_event(ctx, pid, info->role_id, info->pod_id,
                          AUDIT_DECISION_DENY, AUDIT_HOOK_BPRM_CHECK, 0);
         return -1;
     }
+    return 0;
+}
 
+SEC("lsm/task_fix_setgid")
+int BPF_PROG(task_fix_setgid, struct cred *new, const struct cred *old, int flags_arg)
+{
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u8 *flags = NULL;
+    struct process_info *info = enrolled_role_flags(pid, &flags);
+    if (!info)
+        return 0;
+    if (!flags || (!(*flags & 0x10) && gids_gain(new, old))) {
+        emit_audit_event(ctx, pid, info->role_id, info->pod_id,
+                         AUDIT_DECISION_DENY, AUDIT_HOOK_BPRM_CHECK, 0);
+        return -1;
+    }
+    return 0;
+}
+
+// Supplementary groups are how a process reaches files by group -- disk,
+// shadow, docker. Growing the list is a gain; shrinking it is part of dropping
+// privilege, and setgroups(0, NULL) opens the standard drop sequence.
+//
+// A swap that keeps the count identical is permitted. Comparing the lists
+// themselves means walking two variable-length arrays under the verifier, and
+// the count catches the case that matters: reaching a group you were not in.
+static __always_inline int group_count(const struct cred *c)
+{
+    struct group_info *gi = BPF_CORE_READ(c, group_info);
+    return gi ? BPF_CORE_READ(gi, ngroups) : 0;
+}
+
+SEC("lsm/task_fix_setgroups")
+int BPF_PROG(task_fix_setgroups, struct cred *new, const struct cred *old)
+{
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u8 *flags = NULL;
+    struct process_info *info = enrolled_role_flags(pid, &flags);
+    if (!info)
+        return 0;
+    if (!flags || (!(*flags & 0x10) && group_count(new) > group_count(old))) {
+        emit_audit_event(ctx, pid, info->role_id, info->pod_id,
+                         AUDIT_DECISION_DENY, AUDIT_HOOK_BPRM_CHECK, 0);
+        return -1;
+    }
+    return 0;
+}
+
+SEC("lsm/capset")
+int BPF_PROG(capset, struct cred *new, const struct cred *old,
+             const kernel_cap_t *effective, const kernel_cap_t *inheritable,
+             const kernel_cap_t *permitted)
+{
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u8 *flags = NULL;
+    struct process_info *info = enrolled_role_flags(pid, &flags);
+    if (!info)
+        return 0;
+    if (!flags || (!(*flags & 0x10) && caps_gain(new, old))) {
+        emit_audit_event(ctx, pid, info->role_id, info->pod_id,
+                         AUDIT_DECISION_DENY, AUDIT_HOOK_BPRM_CHECK, 0);
+        return -1;
+    }
     return 0;
 }
 

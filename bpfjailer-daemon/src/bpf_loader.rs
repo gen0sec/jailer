@@ -120,10 +120,10 @@ impl BpfJailerBpf {
         }
         log::info!("✓ path_states map available for dentry-based path matching");
 
-        if map_by_name(&object, "inode_cache").is_none() {
-            log::warn!("inode_cache map not found (optional)");
+        if map_by_name(&object, "path_decision_cache").is_none() {
+            log::warn!("path_decision_cache map not found (optional)");
         } else {
-            log::info!("✓ inode_cache map available for caching");
+            log::info!("✓ path_decision_cache map available for caching");
         }
 
         // Auto-enrollment maps
@@ -673,7 +673,7 @@ impl BpfJailerBpf {
             "pending_enrollments",
             "network_rules",
             "path_states",
-            "inode_cache",
+            "path_decision_cache",
             "cache_generation",
             "exec_enrollment",
             "cgroup_enrollment",
@@ -807,7 +807,7 @@ mod root_integration {
             "pending_enrollments",
             "network_rules",
             "path_states",
-            "inode_cache",
+            "path_decision_cache",
             "exec_enrollment",
             "cgroup_enrollment",
             "ip_rules",

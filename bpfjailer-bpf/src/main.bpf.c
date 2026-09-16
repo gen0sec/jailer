@@ -103,13 +103,32 @@ struct {
     __type(value, struct path_state_value);
 } path_states SEC(".maps");
 
-// Inode cache: inode -> cached decision (for performance)
-struct inode_cache_key {
+// Decision cache: a resolved path -> the decision the walk reached for it.
+//
+// Keyed on the path, not the inode. One inode is reachable at more than one
+// path -- a hardlink names it twice within a filesystem, a bind mount names it
+// again under another mount -- and those paths can sit on opposite sides of a
+// rule. Keyed on the inode alone, whichever path was opened first decided for
+// all of them: hardlink a denied file into an allowed directory, read it by
+// the allowed name once, and the deny was cached away. That was unreachable
+// while the walk ignored mounts and every bind-mounted path resolved to the
+// same source anyway; resolving them properly is what exposes it.
+//
+// (dentry, mnt) is exactly what a `struct path` is, and exactly what the walk
+// resolved, so it is what the decision describes. The inode is carried as a
+// recycling guard: a dentry can be freed and its memory reused for an
+// unrelated file, and a stale entry keyed on the address alone would then
+// decide for that file. Pairing it with the inode makes such an entry miss and
+// be re-evaluated instead -- if both addresses match, it is the same dentry
+// pointing at the same inode.
+struct path_cache_key {
     u32 role_id;
+    u64 dentry;
+    u64 mnt;
     u64 inode;
 };
 
-struct inode_cache_value {
+struct path_cache_value {
     u8 decision;      // 1=allow, 0=deny
     u8 _pad[3];
     u32 generation;   // Cache generation for invalidation
@@ -118,9 +137,9 @@ struct inode_cache_value {
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 4096);
-    __type(key, struct inode_cache_key);
-    __type(value, struct inode_cache_value);
-} inode_cache SEC(".maps");
+    __type(key, struct path_cache_key);
+    __type(value, struct path_cache_value);
+} path_decision_cache SEC(".maps");
 
 // Global cache generation counter (incremented on mount changes)
 struct {
@@ -632,16 +651,20 @@ int BPF_PROG(file_open, struct file *file)
         u32 *gen_ptr = bpf_map_lookup_elem(&cache_generation, &zero);
         u32 current_gen = gen_ptr ? *gen_ptr : 0;
 
-        // Check inode cache first
+        // Check the decision cache first
         struct inode *inode = BPF_CORE_READ(dentry, d_inode);
 
+        // Zeroed explicitly: padded key, see path_state_key above.
+        struct path_cache_key cache_key;
+        __builtin_memset(&cache_key, 0, sizeof(cache_key));
+        cache_key.role_id = info->role_id;
+        cache_key.dentry = (u64)dentry;
+        cache_key.mnt = (u64)vfsmnt;
+        cache_key.inode = (u64)inode;
+
         if (inode) {
-            // Zeroed explicitly: padded key, see path_state_key above.
-            struct inode_cache_key cache_key;
-            __builtin_memset(&cache_key, 0, sizeof(cache_key));
-            cache_key.role_id = info->role_id;
-            cache_key.inode = (u64)inode;
-            struct inode_cache_value *cached = bpf_map_lookup_elem(&inode_cache, &cache_key);
+            struct path_cache_value *cached =
+                bpf_map_lookup_elem(&path_decision_cache, &cache_key);
             if (cached && cached->generation == current_gen) {
                 // Cache hit with valid generation
                 if (cached->decision)
@@ -665,16 +688,11 @@ int BPF_PROG(file_open, struct file *file)
             if (result != 0) {
                 // Cache the decision with current generation
                 if (inode) {
-                    // Zeroed explicitly: padded key, see path_state_key above.
-                    struct inode_cache_key cache_key;
-                    __builtin_memset(&cache_key, 0, sizeof(cache_key));
-                    cache_key.role_id = info->role_id;
-                    cache_key.inode = (u64)inode;
-                    struct inode_cache_value val = {
+                    struct path_cache_value val = {
                         .decision = (result == 1) ? 1 : 0,
                         .generation = current_gen,
                     };
-                    bpf_map_update_elem(&inode_cache, &cache_key, &val, 0);
+                    bpf_map_update_elem(&path_decision_cache, &cache_key, &val, 0);
                 }
 
                 if (result == 1) {

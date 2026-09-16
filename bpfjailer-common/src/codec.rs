@@ -755,8 +755,23 @@ mod path_walk_semantics {
 
     /// Walks a path exactly as check_path_state_machine does: exact component
     /// first, then the wildcard slot, terminal wins, otherwise carry the state.
+    ///
+    /// Splitting the path string is the *model's* way of producing components.
+    /// The kernel derives them from the dentry tree instead, and the two do not
+    /// always agree -- see [`kernel_components`] and the mount tests below.
     fn walk(map: &HashMap<[u8; 24], [u8; 16]>, role: u32, path: &str, truncate: bool) -> Decision {
         let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        walk_components(map, role, &components, truncate)
+    }
+
+    /// The walk proper, over components already chosen, so a test can supply
+    /// the ones the kernel really derives rather than the ideal ones.
+    fn walk_components(
+        map: &HashMap<[u8; 24], [u8; 16]>,
+        role: u32,
+        components: &[&str],
+        truncate: bool,
+    ) -> Decision {
         let mut state: u64 = 0;
 
         for component in components.iter().take(MAX_COMPONENTS) {
@@ -858,6 +873,127 @@ mod path_walk_semantics {
         // Single component: unaffected either way.
         let single = rules(7, &[("/root", false)]);
         assert_eq!(walk(&single, 7, "/root/secret.txt", true), Decision::Deny);
+    }
+
+    // ---------------------------------------------------------------------
+    // Where the model and the kernel disagree about the *input* to the walk.
+    //
+    // The walk above is faithful to check_path_state_machine. What it is not
+    // faithful to is how the components reaching that walk are produced.
+    //
+    // The kernel takes `file->f_path.dentry` (main.bpf.c, lsm/file_open) and
+    // discards `f_path.mnt`, then walks `d_parent` until `parent == current`.
+    // That stop condition is the superblock root of the dentry's OWN
+    // filesystem, not the task's visible root -- so the components describe
+    // the path within its mount, which is the path a policy names only when
+    // the file happens to live on the task's root mount.
+    //
+    // These tests pin the current behaviour. They are green on purpose: they
+    // characterise the divergence so that whoever teaches the BPF side to
+    // resolve mounts can see exactly which assertions must flip.
+    // ---------------------------------------------------------------------
+
+    /// Models `collect_path_components`: it walks `d_parent` up from the leaf
+    /// and stops on the MAX_COMPONENTS loop bound, so on an over-deep path the
+    /// components it drops are the ROOT-side ones. The model's `.take()` drops
+    /// the leaf-side ones instead -- opposite ends of the same path.
+    fn kernel_components(path: &str) -> Vec<&str> {
+        let all: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        all[all.len().saturating_sub(MAX_COMPONENTS)..].to_vec()
+    }
+
+    /// A file on the task's own root mount is the case the model gets right:
+    /// the dentry walk reaches the real root, so every component survives.
+    /// This is the control for the two tests below.
+    #[test]
+    fn a_file_on_the_root_mount_derives_the_path_the_policy_names() {
+        let allows = rules(7, &[("/usr/*", true)]);
+        let derived = kernel_components("/usr/bin/cat");
+
+        assert_eq!(derived, ["usr", "bin", "cat"]);
+        assert_eq!(
+            walk_components(&allows, 7, &derived, false),
+            Decision::Allow
+        );
+    }
+
+    /// `/usr` on its own mount: the dentry walk stops at that filesystem's
+    /// root, so the mountpoint component never appears. The walk then starts
+    /// at state 0 on "bin", where the rule has neither an exact transition nor
+    /// a wildcard, and reports no rule -- which the caller turns into a denial
+    /// via the role's allow_file_access flag.
+    #[test]
+    fn a_file_on_its_own_mount_loses_the_mountpoint_component() {
+        let allows = rules(7, &[("/usr/*", true)]);
+
+        // What the policy means, and what the model sees:
+        assert_eq!(walk(&allows, 7, "/usr/bin/cat", false), Decision::Allow);
+
+        // What the kernel derives when /usr is a separate mount: the path
+        // within that mount, with "usr" -- the component the rule keys on --
+        // left behind at the mountpoint.
+        assert_eq!(
+            walk_components(&allows, 7, &["bin", "cat"], false),
+            Decision::NoRule,
+            "an allow-listed path must stop being inert once the BPF side \
+             resolves f_path.mnt instead of discarding it"
+        );
+    }
+
+    /// A bind mount is worse than a truncation: `d_parent` climbs the SOURCE
+    /// tree, so the walk is handed a wholly different path. This is the shape
+    /// behind a container's /etc/hostname, /etc/resolv.conf, /etc/hosts, and
+    /// every mounted secret, configmap and volume.
+    #[test]
+    fn a_bind_mounted_file_derives_its_source_path_not_its_visible_one() {
+        let allows = rules(7, &[("/etc/*", true)]);
+
+        assert_eq!(walk(&allows, 7, "/etc/hostname", false), Decision::Allow);
+
+        // Same file, as the dentry tree describes it.
+        assert_eq!(
+            walk_components(
+                &allows,
+                7,
+                &["var", "lib", "containers", "abc", "hostname"],
+                false
+            ),
+            Decision::NoRule,
+            "the rule names the mount target; the dentry walk yields the source"
+        );
+    }
+
+    /// The second divergence, in the same direction. Both sides cap at
+    /// MAX_COMPONENTS, but from opposite ends: the model keeps the 16 rootmost
+    /// components, the kernel keeps the 16 leafmost. Past that depth the
+    /// kernel's walk begins mid-path, at a state 0 that has no transition for
+    /// it, and an allow-listed path goes inert.
+    #[test]
+    fn an_over_deep_path_loses_its_root_components_not_its_leaf_ones() {
+        let allows = rules(7, &[("/etc/*", true)]);
+        let middle = (1..=18)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let deep = format!("/etc/{middle}/f");
+
+        // 20 components: one past what either side will carry.
+        assert_eq!(deep.split('/').filter(|c| !c.is_empty()).count(), 20);
+
+        // The model truncates from the root end, so "etc" survives and the
+        // wildcard fires on the very next component.
+        assert_eq!(walk(&allows, 7, &deep, false), Decision::Allow);
+
+        // The kernel truncates from the leaf end, so "etc" is gone.
+        let derived = kernel_components(&deep);
+        assert_eq!(derived.len(), MAX_COMPONENTS);
+        assert!(!derived.contains(&"etc"));
+        assert_eq!(
+            walk_components(&allows, 7, &derived, false),
+            Decision::NoRule,
+            "collect_path_components keeps the leafmost components; the model \
+             keeps the rootmost, and only one of them can be right"
+        );
     }
 }
 

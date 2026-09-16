@@ -88,7 +88,7 @@ impl PolicyManager {
         // enforce. Loading it would leave the operator believing a restriction
         // is in force when nothing implements it -- worse than rejecting it.
         for (name, role) in &config.roles {
-            let unenforced = bpfjailer_common::flags::unenforced_flags(&role.flags);
+            let unenforced = bpfjailer_common::policy::unenforced_settings(role);
             if !unenforced.is_empty() {
                 return Err(anyhow::anyhow!(
                     "role '{}' requests {} which this build does not enforce; \
@@ -319,7 +319,7 @@ mod tests {
 
     /// Denying setuid is equally unenforced and must also be refused.
     #[tokio::test]
-    async fn policy_denying_setuid_is_refused() {
+    async fn policy_denying_setuid_is_accepted_now_that_it_is_enforced() {
         let body = UNENFORCED_POLICY
             .replace(
                 r#""require_signed_binary": true, "allow_setuid": true"#,
@@ -335,8 +335,12 @@ mod tests {
         );
         let path = temp_policy("nosetuid", &body);
         let mut pm = PolicyManager::new().unwrap();
-        let err = pm.load_from_file(&path).await.expect_err("must refuse");
-        assert!(format!("{err:#}").contains("allow_setuid"), "got: {err:#}");
+        // Was refused while nothing tested the bit. bprm_check_security now
+        // refuses setuid and setgid binaries and task_fix_setuid refuses
+        // credential changes, so the request is honoured instead.
+        pm.load_from_file(&path)
+            .await
+            .expect("denying setuid is enforced, so it must load");
         let _ = std::fs::remove_file(path);
     }
 

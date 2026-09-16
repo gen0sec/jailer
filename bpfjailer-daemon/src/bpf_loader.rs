@@ -120,6 +120,9 @@ impl BpfJailerBpf {
         }
         log::info!("✓ path_states map available for dentry-based path matching");
 
+        if map_by_name(&object, "exec_states").is_none() {
+            anyhow::bail!("exec_states map not found");
+        }
         if map_by_name(&object, "path_decision_cache").is_none() {
             log::warn!("path_decision_cache map not found (optional)");
         } else {
@@ -380,6 +383,36 @@ impl BpfJailerBpf {
 
         log::info!(
             "Added path state machine: role={} pattern={} -> {} ({} transitions)",
+            role_id,
+            pattern,
+            if allowed { "ALLOW" } else { "DENY" },
+            entries.len()
+        );
+        Ok(())
+    }
+
+    /// Add an execution rule: which binaries an enrolled process may exec.
+    ///
+    /// Same encoding and same pattern syntax as [`Self::add_path_state`], into
+    /// the map the exec hook walks. The path must be the RESOLVED one -- the
+    /// kernel follows symlinks before the hook sees the binary, so on a
+    /// merged-usr system a rule naming /bin/curl matches nothing and
+    /// /usr/bin/curl is what applies.
+    pub fn add_exec_state(&self, role_id: u32, pattern: &str, allowed: bool) -> Result<()> {
+        let object = self.object.lock().unwrap();
+        let map = map_by_name(&object, "exec_states")
+            .ok_or_else(|| anyhow::anyhow!("exec_states map not found"))?;
+
+        let entries = codec::path_state_entries(role_id, pattern, allowed);
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for (key, value) in &entries {
+            map.update(key, value, MapFlags::empty())?;
+        }
+
+        log::info!(
+            "Added execution rule: role={} pattern={} -> {} ({} transitions)",
             role_id,
             pattern,
             if allowed { "ALLOW" } else { "DENY" },
@@ -666,6 +699,7 @@ impl BpfJailerBpf {
             "pending_enrollments",
             "network_rules",
             "path_states",
+            "exec_states",
             "path_decision_cache",
             "cache_generation",
             "exec_enrollment",
@@ -800,6 +834,7 @@ mod root_integration {
             "pending_enrollments",
             "network_rules",
             "path_states",
+            "exec_states",
             "path_decision_cache",
             "exec_enrollment",
             "cgroup_enrollment",

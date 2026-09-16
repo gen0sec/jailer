@@ -213,6 +213,9 @@ impl bpfjailer_common::apply::PolicySink for TrackerSink<'_> {
     fn add_path_state(&mut self, role_id: u32, pattern: &str, allow: bool) -> Result<()> {
         self.0.bpf.add_path_state(role_id, pattern, allow)
     }
+    fn add_exec_state(&mut self, role_id: u32, pattern: &str, allow: bool) -> Result<()> {
+        self.0.bpf.add_exec_state(role_id, pattern, allow)
+    }
     fn add_network_rule(
         &mut self,
         role_id: u32,

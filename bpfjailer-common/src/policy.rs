@@ -325,6 +325,32 @@ impl AllowedDomains {
     }
 }
 
+/// Settings a role asks for that this build does not enforce.
+///
+/// Extends [`crate::flags::unenforced_flags`] to the parts of a role that are
+/// not flags. The rule is the same one the loaders already apply to flags:
+/// a policy that asks for a restriction nothing implements is refused, because
+/// accepting it leaves the operator believing a restriction is in force.
+///
+/// `execution_rules` itself is now enforced -- the binary path is walked by the
+/// exec hook -- but `args_pattern` is not and cannot be: argv lives in the new
+/// process's memory at `bprm` time and is not readable in any way worth
+/// trusting. A rule that sets it would silently match on the path alone, which
+/// is broader than what was written.
+pub fn unenforced_settings(role: &Role) -> Vec<&'static str> {
+    let mut out = crate::flags::unenforced_flags(&role.flags);
+
+    if role
+        .execution_rules
+        .iter()
+        .any(|r| r.args_pattern.is_some())
+    {
+        out.push("execution_rules.args_pattern");
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +368,69 @@ mod tests {
             domain_rules: Vec::new(),
             proxy: None,
         }
+    }
+
+    fn exec_rule(path: &str, args: Option<&str>) -> ExecutionRule {
+        ExecutionRule {
+            binary_path: path.to_string(),
+            args_pattern: args.map(String::from),
+            allow: true,
+        }
+    }
+
+    /// A rule that only names a binary is enforceable: the exec hook walks the
+    /// path with the same state machine file rules use.
+    #[test]
+    fn an_execution_rule_naming_only_a_path_is_enforced() {
+        let mut r = role(1, "web");
+        r.flags.allow_setuid = true;
+        r.execution_rules = vec![exec_rule("/usr/bin/curl", None)];
+        assert!(unenforced_settings(&r).is_empty());
+    }
+
+    /// argv is not readable at bprm time, so a rule carrying args_pattern would
+    /// silently match on the path alone -- broader than what was written. It is
+    /// refused for the same reason require_signed_binary is.
+    #[test]
+    fn an_execution_rule_with_args_pattern_is_refused() {
+        let mut r = role(1, "web");
+        r.flags.allow_setuid = true;
+        r.execution_rules = vec![exec_rule("/usr/bin/curl", Some("--insecure"))];
+        assert_eq!(
+            unenforced_settings(&r),
+            vec!["execution_rules.args_pattern"]
+        );
+    }
+
+    /// One rule out of many is enough to refuse the policy: the others being
+    /// fine does not make the unenforceable one safe.
+    #[test]
+    fn one_rule_with_args_pattern_among_several_is_still_refused() {
+        let mut r = role(1, "web");
+        r.flags.allow_setuid = true;
+        r.execution_rules = vec![
+            exec_rule("/usr/bin/curl", None),
+            exec_rule("/usr/bin/wget", Some("-q")),
+            exec_rule("/usr/bin/id", None),
+        ];
+        assert_eq!(
+            unenforced_settings(&r),
+            vec!["execution_rules.args_pattern"]
+        );
+    }
+
+    /// unenforced_settings must keep reporting the flags it wraps, not replace
+    /// them.
+    #[test]
+    fn it_still_reports_the_unenforced_flags_underneath() {
+        let mut r = role(1, "web");
+        r.flags.allow_setuid = true;
+        r.flags.require_signed_binary = true;
+        r.execution_rules = vec![exec_rule("/usr/bin/curl", Some("x"))];
+        assert_eq!(
+            unenforced_settings(&r),
+            vec!["require_signed_binary", "execution_rules.args_pattern"]
+        );
     }
 
     fn config_with(roles: &[(u32, &str)]) -> PolicyConfig {

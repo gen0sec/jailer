@@ -757,8 +757,9 @@ mod path_walk_semantics {
     /// first, then the wildcard slot, terminal wins, otherwise carry the state.
     ///
     /// Splitting the path string is the *model's* way of producing components.
-    /// The kernel derives them from the dentry tree instead, and the two do not
-    /// always agree -- see [`kernel_components`] and the mount tests below.
+    /// The kernel derives them by walking the path the task sees -- crossing
+    /// mount boundaries, stopping at the task's fs root -- which now yields the
+    /// same components. See the mount tests below.
     fn walk(map: &HashMap<[u8; 24], [u8; 16]>, role: u32, path: &str, truncate: bool) -> Decision {
         let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         walk_components(map, role, &components, truncate)
@@ -772,9 +773,17 @@ mod path_walk_semantics {
         components: &[&str],
         truncate: bool,
     ) -> Decision {
+        // Mirrors `buf->truncated`: a walk that could not collect the whole
+        // path never reached the components a rooted pattern starts at, so
+        // check_path_state_machine reports no rule rather than deciding on the
+        // suffix it did collect.
+        if components.len() > MAX_COMPONENTS {
+            return Decision::NoRule;
+        }
+
         let mut state: u64 = 0;
 
-        for component in components.iter().take(MAX_COMPONENTS) {
+        for component in components.iter() {
             let hash = fnv1a_hash_u64(component);
             let value = map
                 .get(&path_state_key(role, state, hash))
@@ -876,36 +885,31 @@ mod path_walk_semantics {
     }
 
     // ---------------------------------------------------------------------
-    // Where the model and the kernel disagree about the *input* to the walk.
+    // The input to the walk, after the mount fix.
     //
-    // The walk above is faithful to check_path_state_machine. What it is not
-    // faithful to is how the components reaching that walk are produced.
+    // collect_path_components used to climb `d_parent` from
+    // `file->f_path.dentry` and stop at `parent == current` -- the superblock
+    // root of the dentry's OWN filesystem -- with `f_path.mnt` discarded. The
+    // components were therefore the path *within* the mount, and a mountpoint's
+    // own name was never among them, so a pattern whose first component was a
+    // mountpoint matched nothing. Which way that failed depended on the role:
+    // with allow_file_access set a deny rule silently stopped applying, and
+    // without it an allow rule denied everything it was meant to admit.
     //
-    // The kernel takes `file->f_path.dentry` (main.bpf.c, lsm/file_open) and
-    // discards `f_path.mnt`, then walks `d_parent` until `parent == current`.
-    // That stop condition is the superblock root of the dentry's OWN
-    // filesystem, not the task's visible root -- so the components describe
-    // the path within its mount, which is the path a policy names only when
-    // the file happens to live on the task's root mount.
+    // It now mirrors the kernel's prepend_path(): it crosses each mount
+    // boundary to the dentry the mount hangs from in its parent, and stops at
+    // the task's own fs root. The components are the path the task sees, so
+    // these tests supply the visible path -- which is what the walk is now
+    // handed, whichever mounts the path is assembled from.
     //
-    // The consequence is NOT uniformly fail-closed. A walk that matches no
-    // rule returns 0, and file_open then defers to the role's
-    // allow_file_access flag -- so on a role carrying that flag, "no rule" is
-    // an ALLOW. Eleven of the twelve roles in config/policy.json carry it,
-    // including every role that defines deny rules, so the dominant effect of
-    // this divergence is a deny rule that silently stops applying.
-    //
-    // These tests are model-level: they feed the real walk the components the
-    // kernel would derive. Nothing here observes the kernel, so a fix in
-    // main.bpf.c will not flip them -- they must be updated by hand when the
-    // collection side changes. What they buy is a written-down, executable
-    // statement of what today's behaviour actually is.
+    // Still model-level: nothing here observes the kernel, so they cannot
+    // catch a regression made only in main.bpf.c. They state what the fixed
+    // collection side is required to produce.
     // ---------------------------------------------------------------------
 
-    /// The role-flag fallback from `file_open` (main.bpf.c, after the state
-    /// machine returns 0): `if (!(*flags & 0x01)) return -13;`. So `NoRule` is
-    /// an allow for any role with `allow_file_access` set, and a denial only
-    /// for one without it.
+    /// The role-flag fallback from `file_open`: `if (!(*flags & 0x01)) return
+    /// -13;`. So `NoRule` is an allow for any role with `allow_file_access`
+    /// set, and a denial only for one without it.
     fn permitted(decision: Decision, allow_file_access: bool) -> bool {
         match decision {
             Decision::Allow => true,
@@ -914,177 +918,110 @@ mod path_walk_semantics {
         }
     }
 
-    /// Models the mount half of the divergence. `collect_path_components`
-    /// stops at the superblock root of the file's OWN filesystem, so only the
-    /// components below that root survive. `source` is the path as the holding
-    /// filesystem stores it: for a bind mount that is the source path, which
-    /// need share nothing with the path the task sees.
-    fn below_mount_root<'a>(source: &'a str, mount_root: &str) -> Vec<&'a str> {
-        let all: Vec<&'a str> = source.split('/').filter(|c| !c.is_empty()).collect();
-        let depth = mount_root.split('/').filter(|c| !c.is_empty()).count();
-        all[depth.min(all.len())..].to_vec()
-    }
-
-    /// Models the other half: the collection loop climbs from the leaf and
-    /// stops on the MAX_COMPONENTS bound, so on an over-deep path the
-    /// components it drops are the ROOT-side ones. The model's `.take()` drops
-    /// the leaf-side ones instead -- opposite ends of the same path.
-    fn after_leaf_truncation<'a>(components: &[&'a str]) -> Vec<&'a str> {
-        components[components.len().saturating_sub(MAX_COMPONENTS)..].to_vec()
-    }
-
-    /// The control: a file on the task's own root mount, through the same
-    /// helper the mount tests use. The dentry walk reaches the real root, so
-    /// every component survives and the rule decides.
+    /// `/usr` on its own mount. The walk crosses the boundary and picks up
+    /// "usr" from the parent mount, so the pattern naming the mountpoint
+    /// decides. Before the fix this yielded `["bin", "cat"]` and matched
+    /// nothing.
     #[test]
-    fn a_file_on_the_root_mount_derives_the_path_the_policy_names() {
+    fn a_pattern_naming_a_mountpoint_matches_across_the_boundary() {
         let allows = rules(7, &[("/usr/*", true)]);
-        let derived = below_mount_root("/usr/bin/cat", "/");
 
-        assert_eq!(derived, ["usr", "bin", "cat"]);
         assert_eq!(
-            walk_components(&allows, 7, &derived, false),
+            walk_components(&allows, 7, &["usr", "bin", "cat"], false),
             Decision::Allow
         );
     }
 
-    /// `/usr` on its own mount: the walk stops at that filesystem's root, so
-    /// the mountpoint component never appears. The walk starts at state 0 on
-    /// "bin", where the rule has neither an exact transition nor a wildcard.
+    /// A bind mount resolves to where it is mounted, not where it is stored.
+    /// The walk leaves the source filesystem at the bind's root and continues
+    /// from the dentry it hangs from, so a container's /etc/hostname is
+    /// "etc", "hostname" -- not the runtime directory it came from.
     #[test]
-    fn a_file_on_its_own_mount_loses_the_mountpoint_component() {
-        let allows = rules(7, &[("/usr/*", true)]);
+    fn a_bind_mounted_file_resolves_to_its_visible_path() {
+        let allows = rules(7, &[("/etc/*", true)]);
 
-        // What the policy means, and what the model sees:
-        assert_eq!(walk(&allows, 7, "/usr/bin/cat", false), Decision::Allow);
-
-        // What the kernel derives when /usr is a separate mount.
-        let derived = below_mount_root("/usr/bin/cat", "/usr");
-        assert_eq!(derived, ["bin", "cat"]);
         assert_eq!(
-            walk_components(&allows, 7, &derived, false),
+            walk_components(&allows, 7, &["etc", "hostname"], false),
+            Decision::Allow
+        );
+        // The source path it used to yield decides nothing now, because the
+        // walk never visits it.
+        assert_eq!(
+            walk_components(
+                &allows,
+                7,
+                &["var", "lib", "containers", "abc", "hostname"],
+                false
+            ),
             Decision::NoRule
         );
     }
 
-    /// A bind mount is worse than a truncation: `d_parent` climbs the SOURCE
-    /// tree, so the walk is handed a wholly different path. This is the shape
-    /// behind a container's /etc/hostname, /etc/resolv.conf, /etc/hosts, and
-    /// every mounted secret, configmap and volume.
-    #[test]
-    fn a_bind_mounted_file_derives_its_source_path_not_its_visible_one() {
-        let allows = rules(7, &[("/etc/*", true)]);
-
-        assert_eq!(walk(&allows, 7, "/etc/hostname", false), Decision::Allow);
-
-        // The same file, as the filesystem holding it stores it.
-        let derived = below_mount_root("/var/lib/containers/abc/hostname", "/");
-        assert_eq!(
-            walk_components(&allows, 7, &derived, false),
-            Decision::NoRule,
-            "the rule names the mount target; the dentry walk yields the source"
-        );
-    }
-
-    /// The direction that matters most in practice. `ai_agent` in
+    /// The case that mattered most in practice. `ai_agent` in
     /// config/policy.json denies /proc/ and carries allow_file_access, and
-    /// procfs is always its own mount -- so the component the rule keys on is
-    /// never derived, the walk matches nothing, and the role flag opens the
-    /// file the policy exists to deny.
+    /// procfs is always its own mount -- so before the fix the rule never
+    /// applied and the flag opened the file the policy exists to deny.
     #[test]
-    fn a_deny_rule_on_a_separate_mount_fails_open() {
+    fn a_deny_rule_on_a_separate_mount_now_bites() {
         let denies = rules(7, &[("/proc/", false)]);
+        let derived = ["proc", "self", "environ"];
 
-        // On the task's root mount the rule works.
-        let visible = below_mount_root("/proc/self/environ", "/");
-        assert_eq!(walk_components(&denies, 7, &visible, false), Decision::Deny);
+        assert_eq!(walk_components(&denies, 7, &derived, false), Decision::Deny);
+
+        // And it denies for a role that would otherwise be permissive, which
+        // is the whole point of writing the rule.
         assert!(!permitted(
-            walk_components(&denies, 7, &visible, false),
+            walk_components(&denies, 7, &derived, false),
             true
         ));
-
-        // procfs is mounted at /proc, so "proc" is left behind at the
-        // mountpoint and nothing matches.
-        let derived = below_mount_root("/proc/self/environ", "/proc");
-        assert_eq!(derived, ["self", "environ"]);
-        assert_eq!(
-            walk_components(&denies, 7, &derived, false),
-            Decision::NoRule
-        );
-
-        // A role without the flag still denies, by default rather than by
-        // rule. A role with it -- eleven of the twelve shipped roles -- does
-        // not.
-        assert!(!permitted(Decision::NoRule, false));
-        assert!(
-            permitted(walk_components(&denies, 7, &derived, false), true),
-            "a deny rule on a separate mount is inert, and the role flag then \
-             permits the open outright"
-        );
     }
 
-    /// Both sides cap at MAX_COMPONENTS, but from opposite ends: the model
-    /// keeps the 16 rootmost components, the kernel keeps the 16 leafmost.
-    /// Past that depth the kernel's walk begins mid-path, at a state 0 with no
-    /// transition for it, and the rule stops applying.
+    /// A path too deep to collect in full is reported as no rule rather than
+    /// walked from wherever the buffer happened to start. `buf->truncated`
+    /// carries that, and `check_path_state_machine` returns 0 on it.
+    ///
+    /// Walking a suffix let depth alone decide which rule applied: a path
+    /// could shed a deny rule by sitting deeper, or -- worse -- pick up an
+    /// allow rule it was nowhere near, because whichever component landed at
+    /// the start of the buffer was walked as though it sat at the root.
     #[test]
-    fn an_over_deep_path_loses_its_root_components_not_its_leaf_ones() {
+    fn a_path_too_deep_to_collect_decides_nothing() {
         let allows = rules(7, &[("/etc/*", true)]);
-        let middle = (1..=18)
-            .map(|i| format!("d{i}"))
-            .collect::<Vec<_>>()
-            .join("/");
-        let deep = format!("/etc/{middle}/f");
-        let components: Vec<&str> = deep.split('/').filter(|c| !c.is_empty()).collect();
+        let deep: Vec<String> = std::iter::once("etc".to_string())
+            .chain((1..=18).map(|i| format!("d{i}")))
+            .chain(std::iter::once("f".to_string()))
+            .collect();
+        let deep: Vec<&str> = deep.iter().map(String::as_str).collect();
+        assert_eq!(deep.len(), 20);
 
-        // Comfortably past MAX_COMPONENTS, so the two truncations cannot agree.
-        assert_eq!(components.len(), 20);
-        assert!(components.len() > MAX_COMPONENTS);
-
-        // The model truncates from the root end, so "etc" survives and the
-        // wildcard fires on the very next component.
-        assert_eq!(walk(&allows, 7, &deep, false), Decision::Allow);
-
-        // The kernel truncates from the leaf end, so "etc" is gone.
-        let derived = after_leaf_truncation(&components);
-        assert_eq!(derived.len(), MAX_COMPONENTS);
-        assert!(!derived.contains(&"etc"));
         assert_eq!(
-            walk_components(&allows, 7, &derived, false),
+            walk_components(&allows, 7, &deep, false),
             Decision::NoRule,
-            "collect_path_components keeps the leafmost components; the model \
-             keeps the rootmost, and only one of them can be right"
+            "an over-deep path must not be decided on a suffix of itself"
         );
     }
 
-    /// Leaf-end truncation does not only make rules inert -- it also forges
-    /// matches. Once a path is deeper than MAX_COMPONENTS, whichever component
-    /// lands at index `len - 16` is walked as though it sat at the root. A
-    /// process that controls its own directory depth can therefore pick up a
-    /// rule written for a top-level directory it is nowhere near.
+    /// The forge the suffix walk allowed, held shut. "etc" here is an ordinary
+    /// directory five levels down, positioned exactly where leaf-end
+    /// truncation used to promote it to the root -- which made this path match
+    /// /etc/* outright.
     #[test]
-    fn leaf_end_truncation_can_also_forge_a_match() {
+    fn depth_cannot_forge_a_match_on_a_rule_the_path_is_outside() {
         let allows = rules(7, &[("/etc/*", true)]);
-        let filler = (1..=14)
-            .map(|i| format!("x{i}"))
-            .collect::<Vec<_>>()
-            .join("/");
-        // Not under /etc at all: "etc" here is an ordinary directory five
-        // levels down, positioned so truncation promotes it to the root.
-        let forged = format!("/a/b/c/d/etc/{filler}/passwd");
-        let components: Vec<&str> = forged.split('/').filter(|c| !c.is_empty()).collect();
-        assert_eq!(components.len(), 20);
+        let forged: Vec<String> = ["a", "b", "c", "d", "etc"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain((1..=14).map(|i| format!("x{i}")))
+            .chain(std::iter::once("passwd".to_string()))
+            .collect();
+        let forged: Vec<&str> = forged.iter().map(String::as_str).collect();
+        assert_eq!(forged.len(), 20);
+        assert_eq!(forged[4], "etc");
 
-        // Read in full, the allow-list correctly declines to match it.
-        assert_eq!(walk(&allows, 7, &forged, false), Decision::NoRule);
-
-        // Truncated from the leaf end, it is indistinguishable from /etc/...
-        let derived = after_leaf_truncation(&components);
-        assert_eq!(derived[0], "etc");
         assert_eq!(
-            walk_components(&allows, 7, &derived, false),
-            Decision::Allow,
-            "a path outside /etc picks up the /etc allow rule purely by depth"
+            walk_components(&allows, 7, &forged, false),
+            Decision::NoRule,
+            "a path outside /etc must not pick up the /etc rule by being deep"
         );
     }
 }

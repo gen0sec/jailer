@@ -291,9 +291,15 @@ static __always_inline void emit_audit_event(void *ctx, u32 pid, u32 role_id,
 #define FNV1A64_OFFSET_BASIS 0xcbf29ce484222325ULL
 #define FNV1A64_PRIME        0x00000100000001b3ULL
 
+// How many steps the path walk may take. Crossing a mount boundary consumes a
+// step without emitting a component, so this sits above MAX_COMPONENTS to
+// leave room for the stack of mounts above a deep path.
+#define MAX_PATH_WALK_STEPS 32
+
 struct path_components {
     u64 hashes[MAX_COMPONENTS];  // Hash of each component
     u8 count;                     // Number of components collected
+    u8 truncated;                 // Walk stopped before reaching the task's root
 };
 
 struct {
@@ -343,35 +349,104 @@ static __always_inline u64 hash_component(const unsigned char *name, u32 len)
     return hash;
 }
 
-// Walk dentry tree and collect path component hashes (bottom-up)
-static __always_inline int collect_path_components(struct dentry *dentry, struct path_components *buf)
+// A `struct vfsmount` is embedded in the `struct mount` that owns it; these
+// convert between the two. bpf_core_field_offset keeps the arithmetic correct
+// if the field moves between kernel versions.
+static __always_inline struct mount *real_mount(struct vfsmount *vfsmnt)
 {
-    struct dentry *current = dentry;
-    struct dentry *parent = NULL;
+    if (!vfsmnt)
+        return NULL;
+    return (struct mount *)((char *)vfsmnt - bpf_core_field_offset(struct mount, mnt));
+}
+
+static __always_inline struct vfsmount *mount_vfs(struct mount *mnt)
+{
+    if (!mnt)
+        return NULL;
+    return (struct vfsmount *)((char *)mnt + bpf_core_field_offset(struct mount, mnt));
+}
+
+// Walk the path as the task sees it and collect component hashes (bottom-up).
+//
+// This mirrors the kernel's prepend_path(): climb d_parent within a mount, and
+// on reaching that mount's root cross to the dentry it is mounted under in the
+// parent mount and carry on from there.
+//
+// Climbing d_parent alone -- which is what this did before -- stops at the
+// superblock root of the dentry's own filesystem, so the components describe
+// the path *within* the mount and the mountpoint's own name is never among
+// them. A pattern whose first component is a mountpoint then matches nothing:
+// /usr/** never saw "usr" on a system where /usr is a separate mount, and a
+// bind-mounted /etc/hostname walked up the source tree instead. Which way that
+// failed depended on the role: with allow_file_access set, a deny rule
+// silently stopped applying; without it, an allow rule denied everything it
+// was supposed to admit.
+//
+// The walk also stops at the task's own fs root, so a container's paths are
+// collected as the container sees them rather than as the host stores them.
+static __always_inline int collect_path_components(struct dentry *dentry,
+                                                   struct vfsmount *vfsmnt,
+                                                   struct path_components *buf)
+{
     buf->count = 0;
+    buf->truncated = 0;
 
-    #pragma unroll
-    for (int i = 0; i < MAX_COMPONENTS; i++) {
-        if (!current)
+    struct mount *mnt = real_mount(vfsmnt);
+    if (!dentry || !mnt)
+        return 0;
+
+    // Where the task's view of the filesystem ends. Everything above this is
+    // outside what its policy can name.
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+    struct dentry *root_dentry = BPF_CORE_READ(task, fs, root.dentry);
+    struct vfsmount *root_mnt = BPF_CORE_READ(task, fs, root.mnt);
+
+    bool reached_root = false;
+
+    // Deliberately not unrolled. Each pass can call hash_component, whose own
+    // loop does not unroll, so unrolling this one inlines that loop once per
+    // step and multiplies the program: 774 -> 4578 instructions on file_open,
+    // the hook that runs on every open. A bounded loop verifies fine.
+    for (int i = 0; i < MAX_PATH_WALK_STEPS; i++) {
+        if (dentry == root_dentry && vfsmnt == root_mnt) {
+            reached_root = true;
             break;
+        }
 
-        // Bounds check for verifier
+        struct dentry *mnt_root = BPF_CORE_READ(mnt, mnt.mnt_root);
+
+        if (dentry == mnt_root) {
+            struct mount *mnt_parent = BPF_CORE_READ(mnt, mnt_parent);
+            if (!mnt_parent || mnt_parent == mnt) {
+                // Global root: nothing is mounted above this.
+                reached_root = true;
+                break;
+            }
+            // Cross the boundary. No component is emitted here -- the dentry
+            // this mount hangs from is an ordinary dentry in the parent mount
+            // and is emitted on the next pass.
+            dentry = BPF_CORE_READ(mnt, mnt_mountpoint);
+            mnt = mnt_parent;
+            vfsmnt = mount_vfs(mnt);
+            if (!dentry || !vfsmnt)
+                break;
+            continue;
+        }
+
+        struct dentry *parent = BPF_CORE_READ(dentry, d_parent);
+        if (!parent || parent == dentry)
+            break;  // Detached or unreachable; nothing above it to collect.
+
+        // Stop before overrunning the buffer rather than dropping the
+        // root-side components: a suffix of a path is not that path, and
+        // walking one would let depth alone decide which rule applies.
         if (buf->count >= MAX_COMPONENTS)
             break;
 
-        // Read parent pointer using CO-RE
-        parent = BPF_CORE_READ(current, d_parent);
-
-        // If parent == current, we've reached root
-        if (parent == current)
-            break;
-
-        // Read d_name using CO-RE
-        u32 len = BPF_CORE_READ(current, d_name.len);
-        const unsigned char *name = BPF_CORE_READ(current, d_name.name);
+        u32 len = BPF_CORE_READ(dentry, d_name.len);
+        const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
 
         if (len > 0 && name) {
-            // Use local index for verifier
             u8 idx = buf->count;
             if (idx < MAX_COMPONENTS) {
                 buf->hashes[idx] = hash_component(name, len);
@@ -379,8 +454,13 @@ static __always_inline int collect_path_components(struct dentry *dentry, struct
             }
         }
 
-        current = parent;
+        dentry = parent;
     }
+
+    // Anything that stopped short of the task's root was not fully seen, so
+    // the first component collected is not the one a rooted pattern starts at.
+    if (!reached_root)
+        buf->truncated = 1;
 
     return buf->count;
 }
@@ -390,6 +470,13 @@ static __always_inline int check_path_state_machine(u32 role_id, struct path_com
 {
     if (buf->count == 0)
         return 0;  // No rule
+
+    // A walk that never reached the task's root did not see the components a
+    // rooted pattern starts at. Walking what it did collect would match on a
+    // suffix, so a process could pick up -- or shed -- a rule by choosing how
+    // deep to sit. Report no rule and let the role default decide instead.
+    if (buf->truncated)
+        return 0;
 
     // Width is taken from the map key rather than spelled out, and asserted
     // below: a u32 here silently truncated the u64 next_state, so every
@@ -534,8 +621,10 @@ int BPF_PROG(file_open, struct file *file)
         return -13;
     }
 
-    // Get dentry from file->f_path using CO-RE
+    // Both halves of file->f_path: the mount is what makes the dentry's name
+    // meaningful, and dropping it is what made mountpoint patterns inert.
     struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
+    struct vfsmount *vfsmnt = BPF_CORE_READ(file, f_path.mnt);
 
     if (dentry) {
         // Get current cache generation
@@ -567,8 +656,8 @@ int BPF_PROG(file_open, struct file *file)
         struct path_components *buf = bpf_map_lookup_elem(&path_buf, &zero);
 
         if (buf) {
-            // Collect path components by walking dentry tree
-            collect_path_components(dentry, buf);
+            // Collect path components by walking the path the task sees
+            collect_path_components(dentry, vfsmnt, buf);
 
             // Run state machine
             int result = check_path_state_machine(info->role_id, buf);

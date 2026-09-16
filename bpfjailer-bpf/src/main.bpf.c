@@ -134,11 +134,22 @@ struct {
 // decide for that file. Pairing it with the inode makes such an entry miss and
 // be re-evaluated instead -- if both addresses match, it is the same dentry
 // pointing at the same inode.
+//
+// The task's fs root is part of the key too, because the walk stops there and
+// so the components -- and the decision built from them -- depend on it. role_id
+// is inherited across fork, and chroot(2) changes the root while leaving
+// dentry, mnt and inode alone, so without it a parent at / and a chrooted child
+// sharing a role collide on one entry: whichever opened the file first decides
+// for both, across the boundary that was supposed to separate them. Nothing
+// would clear it either -- the generation counter is bumped on mount, umount
+// and rename, and there is no hook for chroot or setns.
 struct path_cache_key {
     u32 role_id;
     u64 dentry;
     u64 mnt;
     u64 inode;
+    u64 root_dentry;
+    u64 root_mnt;
 };
 
 struct path_cache_value {
@@ -404,6 +415,20 @@ static __always_inline struct vfsmount *mount_vfs(struct mount *mnt)
     return (struct vfsmount *)((char *)mnt + bpf_core_field_offset(struct mount, mnt));
 }
 
+// The task's filesystem root: both halves, read once.
+struct fs_root {
+    struct dentry *dentry;
+    struct vfsmount *mnt;
+};
+
+static __always_inline struct fs_root task_fs_root(struct task_struct *task)
+{
+    struct fs_root r = {};
+    r.dentry = BPF_CORE_READ(task, fs, root.dentry);
+    r.mnt = BPF_CORE_READ(task, fs, root.mnt);
+    return r;
+}
+
 // Walk the path as the task sees it and collect component hashes (bottom-up).
 //
 // This mirrors the kernel's prepend_path(): climb d_parent within a mount, and
@@ -422,8 +447,14 @@ static __always_inline struct vfsmount *mount_vfs(struct mount *mnt)
 //
 // The walk also stops at the task's own fs root, so a container's paths are
 // collected as the container sees them rather than as the host stores them.
+//
+// `root` is where the task's view of the filesystem ends -- everything above it
+// is outside what its policy can name. It is passed in rather than read here:
+// every caller already holds the task, and the decision this walk produces
+// depends on the root, so the caller needs it too in order to cache by it.
 static __always_inline int collect_path_components(struct dentry *dentry,
                                                    struct vfsmount *vfsmnt,
+                                                   struct fs_root root,
                                                    struct path_components *buf)
 {
     buf->count = 0;
@@ -433,11 +464,8 @@ static __always_inline int collect_path_components(struct dentry *dentry,
     if (!dentry || !mnt)
         return 0;
 
-    // Where the task's view of the filesystem ends. Everything above this is
-    // outside what its policy can name.
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-    struct dentry *root_dentry = BPF_CORE_READ(task, fs, root.dentry);
-    struct vfsmount *root_mnt = BPF_CORE_READ(task, fs, root.mnt);
+    struct dentry *root_dentry = root.dentry;
+    struct vfsmount *root_mnt = root.mnt;
 
     bool reached_root = false;
 
@@ -678,12 +706,16 @@ int BPF_PROG(file_open, struct file *file)
         struct inode *inode = BPF_CORE_READ(dentry, d_inode);
 
         // Zeroed explicitly: padded key, see path_state_key above.
+        struct fs_root root = task_fs_root(task);
+
         struct path_cache_key cache_key;
         __builtin_memset(&cache_key, 0, sizeof(cache_key));
         cache_key.role_id = info->role_id;
         cache_key.dentry = (u64)dentry;
         cache_key.mnt = (u64)vfsmnt;
         cache_key.inode = (u64)inode;
+        cache_key.root_dentry = (u64)root.dentry;
+        cache_key.root_mnt = (u64)root.mnt;
 
         if (inode) {
             struct path_cache_value *cached =
@@ -703,7 +735,7 @@ int BPF_PROG(file_open, struct file *file)
 
         if (buf) {
             // Collect path components by walking the path the task sees
-            collect_path_components(dentry, vfsmnt, buf);
+            collect_path_components(dentry, vfsmnt, root, buf);
 
             // Run state machine
             int result = check_path_state_machine(&path_states, info->role_id, buf);
@@ -1225,7 +1257,7 @@ int BPF_PROG(bprm_check_security, struct linux_binprm *bprm)
             struct dentry *dentry = BPF_CORE_READ(exe, f_path.dentry);
             struct vfsmount *vfsmnt = BPF_CORE_READ(exe, f_path.mnt);
 
-            collect_path_components(dentry, vfsmnt, buf);
+            collect_path_components(dentry, vfsmnt, task_fs_root(task), buf);
             int verdict = check_path_state_machine(&exec_states, info->role_id, buf);
 
             if (verdict == 1) {
@@ -1250,7 +1282,8 @@ int BPF_PROG(bprm_check_security, struct linux_binprm *bprm)
     return 0;
 }
 
-// Invalidate inode cache on rename - file path changed but inode stays same
+// Invalidate the path decision cache on rename: the path changed, and the
+// decision was cached against it.
 SEC("lsm/path_rename")
 int BPF_PROG(path_rename, const struct path *old_dir, struct dentry *old_dentry,
              const struct path *new_dir, struct dentry *new_dentry)

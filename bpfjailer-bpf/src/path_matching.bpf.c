@@ -16,7 +16,7 @@ struct {
     __uint(max_entries, 1024);
     __type(key, u64);
     __type(value, u32);
-} inode_cache SEC(".maps");
+} path_decision_cache SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);

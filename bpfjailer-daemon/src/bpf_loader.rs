@@ -443,7 +443,7 @@ impl BpfJailerBpf {
 
         map.update(&key, &new_gen.to_ne_bytes(), MapFlags::empty())?;
         log::info!(
-            "Invalidated inode cache (generation: {} -> {})",
+            "Invalidated path decision cache (generation: {} -> {})",
             current,
             new_gen
         );
@@ -693,21 +693,11 @@ impl BpfJailerBpf {
         fs::create_dir_all(&progs_dir)?;
 
         // Pin maps
-        let map_names = [
-            "task_storage",
-            "role_flags",
-            "pending_enrollments",
-            "network_rules",
-            "path_states",
-            "exec_states",
-            "path_decision_cache",
-            "cache_generation",
-            "exec_enrollment",
-            "cgroup_enrollment",
-            "audit_events",
-        ];
+        // Shared with the other loader: copies of this list are how the
+        // program lists drifted -- see bpfjailer_common::programs.
+        let map_names = bpfjailer_common::maps::PINNED_MAPS;
 
-        for name in &map_names {
+        for name in map_names {
             if map_by_name(&object, name).is_some() {
                 let pin_path = format!("{}/{}", maps_dir, name);
                 // Note: pin() requires &mut self in some versions

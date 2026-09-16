@@ -17,7 +17,7 @@ impl PathMatcher {
     pub fn compile_patterns(&self, patterns: &[String]) -> Result<()> {
         validate_patterns(patterns)
     }
-    /// Invalidate the inode cache by incrementing cache generation counter
+    /// Invalidate the path decision cache by incrementing cache generation counter
     pub fn invalidate_cache(&self) -> Result<()> {
         info!("Invalidating path matching cache");
         self.bpf

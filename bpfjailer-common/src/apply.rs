@@ -56,6 +56,11 @@ pub trait PolicySink {
     fn set_role_flags(&mut self, role_id: u32, flags: u8) -> Result<(), Self::Err>;
     fn add_path_state(&mut self, role_id: u32, pattern: &str, allow: bool)
         -> Result<(), Self::Err>;
+    /// An execution rule: the same path encoding as [`Self::add_path_state`],
+    /// written to the map the exec hook walks rather than the one the open
+    /// hook walks.
+    fn add_exec_state(&mut self, role_id: u32, pattern: &str, allow: bool)
+        -> Result<(), Self::Err>;
     fn add_network_rule(
         &mut self,
         role_id: u32,
@@ -106,6 +111,14 @@ pub fn apply_role<S: PolicySink, R: DomainResolver + ?Sized>(
 
     for p in &role.file_paths {
         sink.add_path_state(role_id, &p.pattern, p.allow)?;
+    }
+
+    // Execution rules share the path encoding, so a rule reaches the kernel by
+    // exactly the route a file rule does. `args_pattern` is refused before a
+    // policy gets here -- argv is not readable at bprm time -- so a rule that
+    // arrives has only a path to say.
+    for e in &role.execution_rules {
+        sink.add_exec_state(role_id, &e.binary_path, e.allow)?;
     }
 
     for r in &role.network_rules {
@@ -161,13 +174,14 @@ pub fn apply_role<S: PolicySink, R: DomainResolver + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{DomainRule, IpRule, NetworkRule, PathPattern, ProxyConfig};
+    use crate::policy::{DomainRule, ExecutionRule, IpRule, NetworkRule, PathPattern, ProxyConfig};
     use crate::types::{PolicyFlags, RoleId};
 
     #[derive(Default)]
     struct Recorder {
         flags: Vec<(u32, u8)>,
         paths: Vec<(u32, String, bool)>,
+        execs: Vec<(u32, String, bool)>,
         net: Vec<(u32, u16, u8, u8, bool)>,
         ip: Vec<(u32, String, u8, bool)>,
         domain: Vec<(u32, String, bool)>,
@@ -197,6 +211,10 @@ mod tests {
         }
         fn add_path_state(&mut self, r: u32, p: &str, a: bool) -> Result<(), Self::Err> {
             self.paths.push((r, p.into(), a));
+            Ok(())
+        }
+        fn add_exec_state(&mut self, r: u32, p: &str, a: bool) -> Result<(), Self::Err> {
+            self.execs.push((r, p.into(), a));
             Ok(())
         }
         fn add_network_rule(
@@ -248,6 +266,11 @@ mod tests {
                 pattern: "/etc/shadow".into(),
                 allow: false,
             }],
+            execution_rules: vec![ExecutionRule {
+                binary_path: "/usr/bin/curl".into(),
+                args_pattern: None,
+                allow: false,
+            }],
             network_rules: vec![NetworkRule {
                 protocol: "tcp".into(),
                 address: None,
@@ -256,7 +279,6 @@ mod tests {
                 port_end: None,
                 allow: true,
             }],
-            execution_rules: vec![],
             require_signed_binary: false,
             ip_rules: vec![IpRule {
                 cidr: "10.0.0.0/8".into(),
@@ -289,6 +311,33 @@ mod tests {
         assert_eq!(rec.ip.len(), 1, "ip_rules not applied");
         assert_eq!(rec.domain.len(), 1, "domain_rules not applied");
         assert_eq!(rec.proxy.len(), 1, "proxy not applied");
+        assert_eq!(rec.execs.len(), 1, "execution_rules not applied");
+    }
+
+    /// Execution rules and file rules are walked from state 0 for the same
+    /// role, so they must land in different maps -- sharing one would let a
+    /// file rule decide an exec, and the other way round.
+    #[test]
+    fn execution_rules_do_not_land_in_the_file_map() {
+        let mut rec = Recorder::default();
+        apply_role(&mut rec, &full_role(), &resolving()).unwrap();
+
+        assert_eq!(rec.execs, vec![(7, "/usr/bin/curl".to_string(), false)]);
+        assert_eq!(rec.paths, vec![(7, "/etc/shadow".to_string(), false)]);
+    }
+
+    /// The common case, and the one that must not change behaviour: a role
+    /// with no execution rules writes nothing, so every exec falls through to
+    /// the allow_exec flag exactly as before.
+    #[test]
+    fn a_role_without_execution_rules_writes_no_exec_state() {
+        let mut role = full_role();
+        role.execution_rules.clear();
+        let mut rec = Recorder::default();
+        apply_role(&mut rec, &role, &resolving()).unwrap();
+
+        assert!(rec.execs.is_empty());
+        assert_eq!(rec.paths.len(), 1, "file rules still applied");
     }
 
     #[test]

@@ -103,6 +103,19 @@ struct {
     __type(value, struct path_state_value);
 } path_states SEC(".maps");
 
+// Execution rules, walked exactly like path_states but over the binary being
+// exec'd rather than the file being opened.
+//
+// A separate map, not a namespaced role_id inside path_states: the two walks
+// start from state 0 for the same role, so sharing one map would let a file
+// rule decide an exec and the other way round.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct path_state_key);
+    __type(value, struct path_state_value);
+} exec_states SEC(".maps");
+
 // Decision cache: a resolved path -> the decision the walk reached for it.
 //
 // Keyed on the path, not the inode. One inode is reachable at more than one
@@ -261,6 +274,12 @@ struct {
 #define AUDIT_HOOK_PATH_RENAME    5
 
 // Decision types
+// The mode bits that make an exec hand the caller privilege it did not have.
+// vmlinux.h carries no UAPI constants, so these are spelled out; they are
+// fixed by the on-disk inode format and cannot drift.
+#define S_ISUID 0004000
+#define S_ISGID 0002000
+
 #define AUDIT_DECISION_DENY  0
 #define AUDIT_DECISION_ALLOW 1
 
@@ -485,7 +504,11 @@ static __always_inline int collect_path_components(struct dentry *dentry,
 }
 
 // Run state machine on collected path components (reversed, root-to-leaf)
-static __always_inline int check_path_state_machine(u32 role_id, struct path_components *buf)
+// `states` is the map to walk: path_states for file rules, exec_states for
+// execution rules. Passed as void * and resolved when this inlines into each
+// caller, so both walks are the same code rather than two copies that drift.
+static __always_inline int check_path_state_machine(void *states, u32 role_id,
+                                                    struct path_components *buf)
 {
     if (buf->count == 0)
         return 0;  // No rule
@@ -538,12 +561,12 @@ static __always_inline int check_path_state_machine(u32 role_id, struct path_com
         key.state = state;
         key.component_hash = buf->hashes[idx & (MAX_COMPONENTS - 1)];
 
-        struct path_state_value *val = bpf_map_lookup_elem(&path_states, &key);
+        struct path_state_value *val = bpf_map_lookup_elem(states, &key);
 
         if (!val) {
             // Try wildcard match (component_hash = 0 means match any)
             key.component_hash = 0;
-            val = bpf_map_lookup_elem(&path_states, &key);
+            val = bpf_map_lookup_elem(states, &key);
         }
 
         if (!val) {
@@ -561,7 +584,7 @@ static __always_inline int check_path_state_machine(u32 role_id, struct path_com
     // Reached end without terminal state - check if current state is accepting
     key.state = state;
     key.component_hash = 0;  // End-of-path marker
-    struct path_state_value *final = bpf_map_lookup_elem(&path_states, &key);
+    struct path_state_value *final = bpf_map_lookup_elem(states, &key);
     if (final && final->is_terminal) {
         return final->decision ? 1 : -13;
     }
@@ -683,7 +706,7 @@ int BPF_PROG(file_open, struct file *file)
             collect_path_components(dentry, vfsmnt, buf);
 
             // Run state machine
-            int result = check_path_state_machine(info->role_id, buf);
+            int result = check_path_state_machine(&path_states, info->role_id, buf);
 
             if (result != 0) {
                 // Cache the decision with current generation
@@ -1166,8 +1189,59 @@ int BPF_PROG(bprm_check_security, struct linux_binprm *bprm)
         return -13;
     }
 
-    // Only check allow_exec for CHILD processes (when already enrolled)
-    if (was_enrolled && !(*flags & 0x04)) {
+    // Everything below applies only to an already-enrolled process exec'ing
+    // something else. The exec that CAUSES enrollment returned above: that
+    // binary is named in exec_enrollments, and gating it on a second list would
+    // only be a way to enrol a process and immediately kill it.
+    if (!was_enrolled) {
+        return 0;
+    }
+
+    struct file *exe = BPF_CORE_READ(bprm, file);
+
+    // A setuid or setgid binary hands the caller privilege it did not have.
+    // role_flags bit 0x10 is allow_setuid; a role without it does not get to
+    // gain privilege that way. Checked before the exec rules, because a rule
+    // permitting a path must not also permit escalation through it.
+    if (!(*flags & 0x10) && exe) {
+        umode_t mode = BPF_CORE_READ(exe, f_inode, i_mode);
+        if (mode & (S_ISUID | S_ISGID)) {
+            emit_audit_event(ctx, pid, info->role_id, info->pod_id,
+                             AUDIT_DECISION_DENY, AUDIT_HOOK_BPRM_CHECK, 0);
+            return -13;
+        }
+    }
+
+    // Execution rules, walked over the binary's resolved path with the same
+    // state machine and the same mount-crossing walk that file rules use.
+    //
+    // The kernel resolves symlinks before security_bprm_check is reached, so
+    // f_path is the real path and a rule must name it: on merged-usr,
+    // /bin/curl matches nothing and /usr/bin/curl is what applies.
+    if (exe) {
+        u32 zero = 0;
+        struct path_components *buf = bpf_map_lookup_elem(&path_buf, &zero);
+        if (buf) {
+            struct dentry *dentry = BPF_CORE_READ(exe, f_path.dentry);
+            struct vfsmount *vfsmnt = BPF_CORE_READ(exe, f_path.mnt);
+
+            collect_path_components(dentry, vfsmnt, buf);
+            int verdict = check_path_state_machine(&exec_states, info->role_id, buf);
+
+            if (verdict == 1) {
+                return 0;      // A rule names this binary and allows it.
+            }
+            if (verdict != 0) {
+                emit_audit_event(ctx, pid, info->role_id, info->pod_id,
+                                 AUDIT_DECISION_DENY, AUDIT_HOOK_BPRM_CHECK, 0);
+                return -13;    // A rule names it and refuses it.
+            }
+            // verdict == 0: no rule named it. Fall through to the flag, which
+            // is what an empty execution_rules leaves every exec doing.
+        }
+    }
+
+    if (!(*flags & 0x04)) {
         emit_audit_event(ctx, pid, info->role_id, info->pod_id,
                          AUDIT_DECISION_DENY, AUDIT_HOOK_BPRM_CHECK, 0);
         return -13;
@@ -1228,6 +1302,39 @@ int BPF_PROG(sb_umount, struct vfsmount *mnt, int flags)
 
 // Block ptrace/debugging of enrolled processes
 // Flag: 0x20 = allow_ptrace
+// Block an enrolled process changing its credentials.
+// Flag: 0x10 = allow_setuid
+//
+// The bprm hook above refuses to EXEC a setuid binary. This is the other route
+// to the same privilege: a process that already holds the capability calling
+// setuid/setresuid/setfsuid directly. Enforcing only the exec side would make
+// allow_setuid read broader than it behaves, which is the failure this whole
+// flag was stuck in -- it was packed into role_flags and tested nowhere.
+SEC("lsm/task_fix_setuid")
+int BPF_PROG(task_fix_setuid, struct cred *new, const struct cred *old, int flags_arg)
+{
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+    struct process_info *info = bpf_task_storage_get(&task_storage, task, NULL, 0);
+
+    if (!info || info->pod_id == 0) {
+        return 0;  // Not enrolled, not ours to police
+    }
+
+    u8 *flags = bpf_map_lookup_elem(&role_flags, &info->role_id);
+    if (!flags) {
+        return -1;
+    }
+
+    if (!(*flags & 0x10)) {
+        u32 pid = bpf_get_current_pid_tgid() >> 32;
+        emit_audit_event(ctx, pid, info->role_id, info->pod_id,
+                         AUDIT_DECISION_DENY, AUDIT_HOOK_BPRM_CHECK, 0);
+        return -1;
+    }
+
+    return 0;
+}
+
 SEC("lsm/ptrace_access_check")
 int BPF_PROG(ptrace_access_check, struct task_struct *child, unsigned int mode)
 {

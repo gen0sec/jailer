@@ -30,6 +30,7 @@ pub const LSM_PROGRAMS: &[&str] = &[
     "path_rename",
     "sb_mount",
     "sb_umount",
+    "task_fix_setuid",
     "ptrace_access_check",
     "kernel_module_request",
     "bpf",

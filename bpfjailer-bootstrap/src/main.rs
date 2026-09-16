@@ -105,7 +105,7 @@ fn load_policy() -> Result<PolicyConfig> {
     // Refuse a policy asking for something this build does not enforce, rather
     // than pinning it and looking protected. Same check as the daemon.
     for (name, role) in &config.roles {
-        let unenforced = bpfjailer_common::flags::unenforced_flags(&role.flags);
+        let unenforced = bpfjailer_common::policy::unenforced_settings(role);
         if !unenforced.is_empty() {
             anyhow::bail!(
                 "role '{}' requests {} which this build does not enforce; \
@@ -198,6 +198,14 @@ impl PolicySink for ObjectSink<'_> {
 
     fn add_path_state(&mut self, role_id: u32, pattern: &str, allow: bool) -> Result<()> {
         let map = self.map("path_states")?;
+        for (key, value) in codec::path_state_entries(role_id, pattern, allow) {
+            map.update(&key, &value, MapFlags::empty())?;
+        }
+        Ok(())
+    }
+
+    fn add_exec_state(&mut self, role_id: u32, pattern: &str, allow: bool) -> Result<()> {
+        let map = self.map("exec_states")?;
         for (key, value) in codec::path_state_entries(role_id, pattern, allow) {
             map.update(&key, &value, MapFlags::empty())?;
         }
@@ -368,6 +376,7 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
         "pending_enrollments",
         "network_rules",
         "path_states",
+        "exec_states",
         "path_decision_cache",
         "cache_generation",
         "exec_enrollment",

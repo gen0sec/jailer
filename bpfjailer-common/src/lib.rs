@@ -5,6 +5,7 @@ pub mod codec;
 pub mod flags;
 pub mod hash;
 pub mod policy;
+pub mod programs;
 pub mod types;
 
 pub use policy::*;

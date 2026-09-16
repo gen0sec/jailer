@@ -370,21 +370,11 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
     fs::create_dir_all(&links_dir)?;
 
     // Pin all maps
-    let map_names = [
-        "task_storage",
-        "role_flags",
-        "pending_enrollments",
-        "network_rules",
-        "path_states",
-        "exec_states",
-        "path_decision_cache",
-        "cache_generation",
-        "exec_enrollment",
-        "cgroup_enrollment",
-        "audit_events",
-    ];
+    // Shared with the other loader: copies of this list are how the
+    // program lists drifted -- see bpfjailer_common::programs.
+    let map_names = bpfjailer_common::maps::PINNED_MAPS;
 
-    for name in &map_names {
+    for name in map_names {
         if let Some(mut map) = map_mut_by_name(object, name) {
             let pin_path = format!("{}/{}", maps_dir, name);
             if let Err(e) = map.pin(&pin_path) {

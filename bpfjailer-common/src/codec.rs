@@ -824,6 +824,28 @@ mod path_walk_semantics {
         walk(&rules(7, patterns), 7, path, false)
     }
 
+    /// Two patterns where one is a prefix of the other collide, and the more
+    /// specific one silently destroys the broader.
+    ///
+    /// "/usr/**" drops the "**" and is a single component: a TERMINAL allow at
+    /// (role, state 0, hash("usr")). "/usr/bin/**" writes that same key as a
+    /// NON-terminal transition. Whichever the loader applies second wins, so
+    /// adding /usr/bin/** to a role that already allows /usr/** stops /usr/**
+    /// matching anything -- including the loader's own libraries.
+    #[test]
+    fn a_more_specific_pattern_clobbers_the_broader_one() {
+        let broad = path_state_entries(9, "/usr/**", true);
+        let narrow = path_state_entries(9, "/usr/bin/**", true);
+
+        assert_eq!(broad.len(), 1, "/usr/** is one transition");
+        assert_eq!(broad[0].0, narrow[0].0, "both write the same key");
+        assert_eq!(broad[0].1[8], 1, "/usr/** is terminal there");
+        assert_eq!(
+            narrow[0].1[8], 0,
+            "/usr/bin/** is not, so it erases the allow"
+        );
+    }
+
     #[test]
     fn an_allow_list_admits_what_it_lists_and_is_silent_about_the_rest() {
         let list = &[("/etc/*", true), ("/usr/*", true)][..];

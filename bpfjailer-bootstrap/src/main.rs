@@ -152,22 +152,13 @@ fn load_bpf_object() -> Result<(Object, Vec<Link>)> {
     log::info!("BPF object loaded successfully");
 
     // Attach LSM programs
-    let program_names = [
-        "task_alloc",
-        "file_open",
-        "socket_bind",
-        "socket_connect",
-        "bprm_check_security",
-        "path_rename",
-        "sb_mount",
-        "sb_umount",
-        "ptrace_access_check",
-        "kernel_module_request",
-        "bpf",
-    ];
+    // Shared with the daemon. The two lists had drifted, and a program neither
+    // loader attaches enforces nothing while still logging a clean load -- see
+    // bpfjailer_common::programs.
+    let program_names = bpfjailer_common::programs::LSM_PROGRAMS;
 
     let mut links = Vec::new();
-    for name in &program_names {
+    for name in program_names {
         if let Some(prog) = prog_by_name(&object, name) {
             let link = prog
                 .attach()
@@ -396,21 +387,11 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
     }
 
     // Pin all programs
-    let prog_names = [
-        "task_alloc",
-        "file_open",
-        "socket_bind",
-        "socket_connect",
-        "bprm_check_security",
-        "path_rename",
-        "sb_mount",
-        "sb_umount",
-        "ptrace_access_check",
-        "kernel_module_request",
-        "bpf",
-    ];
+    // Same shared list the attach loop uses: a program that is attached but
+    // never pinned does not survive the bootstrap exiting.
+    let prog_names = bpfjailer_common::programs::LSM_PROGRAMS;
 
-    for name in &prog_names {
+    for name in prog_names {
         if let Some(mut prog) = prog_by_name(object, name) {
             let pin_path = format!("{}/{}", progs_dir, name);
             if let Err(e) = prog.pin(&pin_path) {

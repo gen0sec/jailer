@@ -159,20 +159,13 @@ impl BpfJailerBpf {
 
         // Load and attach LSM programs
         log::info!("Loading and attaching LSM programs...");
-        let program_names = [
-            "task_alloc",
-            "file_open",
-            "socket_bind",
-            "socket_connect",
-            "socket_sendmsg",
-            "bprm_check_security",
-            "path_rename",
-            "sb_mount",
-            "sb_umount",
-        ];
+        // Shared with the bootstrap. The two lists had drifted, and a program
+        // neither loader attaches enforces nothing while still logging a clean
+        // load -- see bpfjailer_common::programs.
+        let program_names = bpfjailer_common::programs::LSM_PROGRAMS;
 
         // LSM programs must be explicitly attached
-        for name in &program_names {
+        for name in program_names {
             match prog_by_name(&object, name) {
                 Some(prog) => {
                     match prog.attach() {

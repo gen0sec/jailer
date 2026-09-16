@@ -176,10 +176,13 @@ pub const ENFORCED_FLAGS: u8 = FLAG_ALLOW_FILE_ACCESS
 /// therefore gets no enforcement. Callers use this to refuse such a policy
 /// rather than apply it and look protected.
 ///
-/// `allow_setuid` was in the same position until `bprm_check_security` began
-/// refusing setuid and setgid binaries and `task_fix_setuid` began refusing
-/// credential changes. It is enforced now, so denying it is honoured rather
-/// than rejected.
+/// `allow_setuid` was in the same position until the privilege-gain routes were
+/// closed: `bprm_check_security` refuses an exec the kernel marked
+/// `secureexec`, and `task_fix_setuid`, `task_fix_setgid`, `task_fix_setgroups`
+/// and `capset` refuse a credential transition that gains a uid, a gid, a
+/// supplementary group or a capability. Transitions that drop privilege are
+/// permitted, so a daemon can still hand itself to a service user. It is
+/// enforced now, so denying it is honoured rather than rejected.
 ///
 /// Only restrictive intent is reported: `allow_setuid: true` grants something
 /// that is unrestricted anyway, so it is not misleading. `allow_setuid: false`

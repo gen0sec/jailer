@@ -164,33 +164,32 @@ mod tests {
 pub const ENFORCED_FLAGS: u8 = FLAG_ALLOW_FILE_ACCESS
     | FLAG_ALLOW_NETWORK
     | FLAG_ALLOW_EXEC
-    | FLAG_ALLOW_SETUID
     | FLAG_ALLOW_PTRACE
     | FLAG_ALLOW_MODULE_LOAD
     | FLAG_ALLOW_BPF_LOAD;
 
 /// Names of flags a role sets that the BPF side does not enforce.
 ///
-/// `require_signed_binary` is accepted by the policy schema and written into
-/// `role_flags`, but `main.bpf.c` never tests that bit. A policy asking for it
-/// therefore gets no enforcement. Callers use this to refuse such a policy
-/// rather than apply it and look protected.
+/// `require_signed_binary` and `allow_setuid` are accepted by the policy schema
+/// and written into `role_flags`, but `main.bpf.c` never tests those bits. A
+/// policy asking for them therefore gets no enforcement. Callers use this to
+/// refuse such a policy rather than apply it and look protected.
 ///
-/// `allow_setuid` was in the same position until the privilege-gain routes were
-/// closed: `bprm_check_security` refuses an exec the kernel marked
-/// `secureexec`, and `task_fix_setuid`, `task_fix_setgid`, `task_fix_setgroups`
-/// and `capset` refuse a credential transition that gains a uid, a gid, a
-/// supplementary group or a capability. Transitions that drop privilege are
-/// permitted, so a daemon can still hand itself to a service user. It is
-/// enforced now, so denying it is honoured rather than rejected.
-///
-/// Only restrictive intent is reported: `allow_setuid: true` grants something
-/// that is unrestricted anyway, so it is not misleading. `allow_setuid: false`
-/// asks for a restriction that will not happen, and is.
+/// `allow_setuid` was briefly moved into [`ENFORCED_FLAGS`] on the strength of
+/// a `bprm_check_security` gate reading `bprm->secureexec`. That gate could
+/// never fire: `bprm_fill_uid`, which sets the bit, runs from
+/// `bprm_creds_from_file` inside `begin_new_exec`, which `load_binary` reaches
+/// only AFTER `search_binary_handler` has already called
+/// `security_bprm_check`. The bit is always 0 there. Enforcing it needs the
+/// `bprm_creds_from_file` hook instead; until then this stays honest and the
+/// policy is refused.
 pub fn unenforced_flags(flags: &PolicyFlags) -> Vec<&'static str> {
     let mut out = Vec::new();
     if flags.require_signed_binary {
         out.push("require_signed_binary");
+    }
+    if !flags.allow_setuid {
+        out.push("allow_setuid=false");
     }
     out
 }
@@ -213,23 +212,33 @@ mod unenforced_tests {
         }
     }
 
+    /// Derived from the BPF source, not restated as a literal.
+    ///
+    /// This test used to assert `ENFORCED_FLAGS` against a hand-written
+    /// constant with a comment listing the bits. That is what let `0x10` be
+    /// declared enforced on the strength of a gate that could never fire: the
+    /// comment and the literal were both edited to agree with the claim, and
+    /// nothing checked the claim against `main.bpf.c`. Scanning the source is
+    /// what `maps.rs` and `programs.rs` do, and it is what catches this.
     #[test]
-    fn enforced_set_matches_the_bits_bpf_tests() {
-        // main.bpf.c tests 0x01, 0x02, 0x04, 0x10, 0x20, 0x40, 0x80.
+    fn enforced_set_matches_the_bits_the_bpf_source_tests() {
+        const BPF_SOURCE: &str = include_str!("../../bpfjailer-bpf/src/main.bpf.c");
+
+        let mut tested = 0u8;
+        for (at, _) in BPF_SOURCE.match_indices("flags & 0x") {
+            let rest = &BPF_SOURCE[at + "flags & 0x".len()..];
+            let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            if let Ok(bit) = u8::from_str_radix(&hex, 16) {
+                tested |= bit;
+            }
+        }
+
+        assert_ne!(tested, 0, "the `flags & 0x..` scan found nothing");
         assert_eq!(
-            ENFORCED_FLAGS,
-            0x01 | 0x02 | 0x04 | 0x10 | 0x20 | 0x40 | 0x80
-        );
-        assert_eq!(
-            ENFORCED_FLAGS & FLAG_REQUIRE_SIGNED_BINARY,
-            0,
-            "require_signed_binary is not enforced"
-        );
-        assert_ne!(
-            ENFORCED_FLAGS & FLAG_ALLOW_SETUID,
-            0,
-            "allow_setuid is enforced: bprm_check_security refuses setuid and \
-             setgid binaries, task_fix_setuid refuses credential changes"
+            ENFORCED_FLAGS, tested,
+            "ENFORCED_FLAGS says {ENFORCED_FLAGS:#04x} but main.bpf.c tests \
+             {tested:#04x}; a bit claimed here that the BPF side never reads is \
+             a restriction the operator is told is in force and is not"
         );
     }
 
@@ -245,14 +254,11 @@ mod unenforced_tests {
         assert_eq!(unenforced_flags(&f), vec!["require_signed_binary"]);
     }
 
-    /// This used to be reported, and refused with it: nothing tested the bit,
-    /// so a role denying setuid was told the policy could not be applied. Both
-    /// routes to that privilege are now closed, so the request is honoured.
     #[test]
-    fn denying_setuid_is_accepted_now_that_it_is_enforced() {
+    fn denying_setuid_is_reported_because_it_will_not_happen() {
         let mut f = permissive();
         f.allow_setuid = false;
-        assert!(unenforced_flags(&f).is_empty());
+        assert_eq!(unenforced_flags(&f), vec!["allow_setuid=false"]);
     }
 
     #[test]
@@ -269,8 +275,7 @@ mod unenforced_tests {
         f.allow_setuid = false;
         assert_eq!(
             unenforced_flags(&f),
-            vec!["require_signed_binary"],
-            "only require_signed_binary is still unenforced"
+            vec!["require_signed_binary", "allow_setuid=false"]
         );
     }
 

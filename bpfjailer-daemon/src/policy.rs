@@ -319,7 +319,7 @@ mod tests {
 
     /// Denying setuid is equally unenforced and must also be refused.
     #[tokio::test]
-    async fn policy_denying_setuid_is_accepted_now_that_it_is_enforced() {
+    async fn policy_denying_setuid_is_refused() {
         let body = UNENFORCED_POLICY
             .replace(
                 r#""require_signed_binary": true, "allow_setuid": true"#,
@@ -335,12 +335,8 @@ mod tests {
         );
         let path = temp_policy("nosetuid", &body);
         let mut pm = PolicyManager::new().unwrap();
-        // Was refused while nothing tested the bit. bprm_check_security now
-        // refuses setuid and setgid binaries and task_fix_setuid refuses
-        // credential changes, so the request is honoured instead.
-        pm.load_from_file(&path)
-            .await
-            .expect("denying setuid is enforced, so it must load");
+        let err = pm.load_from_file(&path).await.expect_err("must refuse");
+        assert!(format!("{err:#}").contains("allow_setuid"), "got: {err:#}");
         let _ = std::fs::remove_file(path);
     }
 

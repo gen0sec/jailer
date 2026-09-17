@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bpfjailer_common::codec;
+use bpfjailer_common::codec::PathStateEntry;
 use libbpf_rs::MapCore;
 use libbpf_rs::{MapFlags, Object, ObjectBuilder};
 use std::path::PathBuf;
@@ -362,62 +363,26 @@ impl BpfJailerBpf {
         Ok(())
     }
 
-    /// Add a path pattern to the state machine
-    /// Pattern examples: "/var/www/", "/tmp/*", "/etc/passwd"
-    /// Supports:
-    ///   - Exact paths: "/etc/passwd"
-    ///   - Directory prefixes: "/var/www/" (matches everything under /var/www/)
-    ///   - Wildcards: "/var/lib/*/data" (* matches any single component)
-    pub fn add_path_state(&self, role_id: u32, pattern: &str, allowed: bool) -> Result<()> {
-        let object = self.object.lock().unwrap();
-        let map = map_by_name(&object, "path_states")
-            .ok_or_else(|| anyhow::anyhow!("path_states map not found"))?;
-
-        let entries = codec::path_state_entries(role_id, pattern, allowed);
-        if entries.is_empty() {
-            return Ok(());
-        }
-        for (key, value) in &entries {
-            map.update(key, value, MapFlags::empty())?;
-        }
-
-        log::info!(
-            "Added path state machine: role={} pattern={} -> {} ({} transitions)",
-            role_id,
-            pattern,
-            if allowed { "ALLOW" } else { "DENY" },
-            entries.len()
-        );
-        Ok(())
-    }
-
-    /// Add an execution rule: which binaries an enrolled process may exec.
+    /// Write a role's already-encoded transitions into one of the two state
+    /// maps.
     ///
-    /// Same encoding and same pattern syntax as [`Self::add_path_state`], into
-    /// the map the exec hook walks. The path must be the RESOLVED one -- the
-    /// kernel follows symlinks before the hook sees the binary, so on a
-    /// merged-usr system a rule naming /bin/curl matches nothing and
-    /// /usr/bin/curl is what applies.
-    pub fn add_exec_state(&self, role_id: u32, pattern: &str, allowed: bool) -> Result<()> {
-        let object = self.object.lock().unwrap();
-        let map = map_by_name(&object, "exec_states")
-            .ok_or_else(|| anyhow::anyhow!("exec_states map not found"))?;
-
-        let entries = codec::path_state_entries(role_id, pattern, allowed);
+    /// Takes entries rather than a pattern: a role's rules are encoded together
+    /// by `codec::path_state_entries_for_role`, because two patterns where one
+    /// is a prefix of the other share a key and writing them one at a time let
+    /// the later erase the earlier.
+    pub fn write_states(&self, map_name: &str, entries: &[PathStateEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        for (key, value) in &entries {
+        let object = self.object.lock().unwrap();
+        let map = map_by_name(&object, map_name)
+            .ok_or_else(|| anyhow::anyhow!("{} map not found", map_name))?;
+
+        for (key, value) in entries {
             map.update(key, value, MapFlags::empty())?;
         }
 
-        log::info!(
-            "Added execution rule: role={} pattern={} -> {} ({} transitions)",
-            role_id,
-            pattern,
-            if allowed { "ALLOW" } else { "DENY" },
-            entries.len()
-        );
+        log::info!("Wrote {} transitions into {}", entries.len(), map_name);
         Ok(())
     }
 
@@ -864,12 +829,17 @@ mod root_integration {
         assert!(lookup(&b, "network_rules", &key).is_none(), "entry removed");
     }
 
+    /// Encode a role the way the loaders do, then write it.
+    fn write_role(b: &BpfJailerBpf, role: u32, rules: &[(&str, bool)]) {
+        let entries = codec::path_state_entries_for_role(role, rules).expect("no conflicts");
+        b.write_states("path_states", &entries).expect("write");
+    }
+
     #[test]
     #[ignore = "requires root"]
     fn path_state_writes_one_entry_per_component() {
         let b = bpf_or_skip!();
-        b.add_path_state(5, "/etc/ssh/sshd_config", false)
-            .expect("add");
+        write_role(&b, 5, &[("/etc/ssh/sshd_config", false)]);
         for (key, expected) in codec::path_state_entries(5, "/etc/ssh/sshd_config", false) {
             let got = lookup(&b, "path_states", &key).expect("transition present");
             assert_eq!(
@@ -884,7 +854,7 @@ mod root_integration {
     #[ignore = "requires root"]
     fn path_state_wildcards_are_stored_under_hash_zero() {
         let b = bpf_or_skip!();
-        b.add_path_state(6, "/home/*/.ssh", false).expect("add");
+        write_role(&b, 6, &[("/home/*/.ssh", false)]);
         let entries = codec::path_state_entries(6, "/home/*/.ssh", false);
         let wildcard = &entries[1];
         assert!(lookup(&b, "path_states", &wildcard.0).is_some());
@@ -894,7 +864,7 @@ mod root_integration {
     #[ignore = "requires root"]
     fn directory_pattern_adds_the_trailing_wildcard_transition() {
         let b = bpf_or_skip!();
-        b.add_path_state(8, "/var/secrets/", false).expect("add");
+        write_role(&b, 8, &[("/var/secrets/", false)]);
         let entries = codec::path_state_entries(8, "/var/secrets/", false);
         let last = entries.last().expect("at least one entry");
         let got = lookup(&b, "path_states", &last.0).expect("wildcard terminal present");

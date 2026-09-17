@@ -11,7 +11,12 @@
 //! network byte order to match `sin_addr.s_addr`.
 
 use crate::hash::fnv1a_hash_u64;
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
+
+/// One `path_states` / `exec_states` row: the 24-byte key and 16-byte value the
+/// BPF side reads.
+pub type PathStateEntry = ([u8; 24], [u8; 16]);
 
 /// Terminal state meaning "allow", written into `path_state_value.next_state`.
 pub const PATH_STATE_ACCEPT: u64 = 0xFFFF_FFFF_FFFF_FFFE;
@@ -58,7 +63,7 @@ pub fn pattern_components(pattern: &str) -> Vec<&str> {
 ///
 /// Shared by the daemon and the daemonless bootstrap, which previously each
 /// had their own copy of this walk.
-pub fn path_state_entries(role_id: u32, pattern: &str, allow: bool) -> Vec<([u8; 24], [u8; 16])> {
+pub fn path_state_entries(role_id: u32, pattern: &str, allow: bool) -> Vec<PathStateEntry> {
     let components = pattern_components(pattern);
     let mut out = Vec::with_capacity(components.len());
     let mut state: u64 = 0;
@@ -105,6 +110,176 @@ pub fn path_state_entries(role_id: u32, pattern: &str, allow: bool) -> Vec<([u8;
         ));
     }
     out
+}
+
+/// The state a walk is in after consuming `components`.
+///
+/// Must match the derivation [`path_state_entries`] uses, so the two encoders
+/// agree on where a pattern's transitions live.
+fn state_after(role_id: u32, components: &[&str]) -> u64 {
+    if components.is_empty() {
+        0
+    } else {
+        fnv1a_hash_u64(&format!("{}:{}", role_id, components.join("/")))
+    }
+}
+
+/// One node of the rule trie: a path prefix, and whatever a pattern said about
+/// it.
+struct RuleNode<'a> {
+    components: Vec<&'a str>,
+    children: BTreeMap<&'a str, usize>,
+    decision: Option<bool>,
+    /// The pattern that set `decision`, and the one that first created this
+    /// node -- carried only so a refusal can name both sides of a conflict.
+    decided_by: Option<&'a str>,
+    created_by: &'a str,
+}
+
+/// Build every `(key, value)` pair for a role's whole rule list at once.
+///
+/// [`path_state_entries`] encodes one pattern in isolation, and the loaders
+/// write each pattern's entries in turn with `map.update`. Two patterns where
+/// one is a prefix of the other therefore write the same key and the later one
+/// wins: `/usr/**` writes a TERMINAL at `(role, 0, hash("usr"))` and
+/// `/usr/bin/**` writes that same key as a transition, so whichever the loader
+/// applied second erased the other. Order came from the order of `file_paths`
+/// in the policy, and nothing reported it.
+///
+/// Encoding a role together fixes that by making the broader decision
+/// *inherited* rather than overwritten. A terminal already means "this node and
+/// everything below it"; when a deeper pattern has to pass through that node,
+/// the edge into it becomes a transition and the decision moves to a wildcard
+/// terminal at the node's own state, where it still covers every sibling the
+/// deeper pattern does not name. Inheritance is transitive, so `/usr/**` keeps
+/// covering `/usr/lib/other` even though `/usr/lib/syslog-ng/**` forced a state
+/// at `lib`.
+///
+/// The walk needs no change for this: it already tries the exact key, then the
+/// wildcard key at the same state, and finally `(state, 0)` when it runs out of
+/// components.
+///
+/// # Errors
+///
+/// A `*` component is stored as hash 0 -- the same slot an inherited decision
+/// needs -- so a node cannot carry both. That combination is refused, naming
+/// both patterns, rather than silently dropping one of them.
+pub fn path_state_entries_for_role(
+    role_id: u32,
+    rules: &[(&str, bool)],
+) -> Result<Vec<PathStateEntry>, Vec<String>> {
+    let mut nodes: Vec<RuleNode> = vec![RuleNode {
+        components: Vec::new(),
+        children: BTreeMap::new(),
+        decision: None,
+        decided_by: None,
+        created_by: "",
+    }];
+
+    for (pattern, allow) in rules {
+        let components = pattern_components(pattern);
+        if components.is_empty() {
+            // "/" and "/**" name no component, exactly as the per-pattern
+            // encoder treats them.
+            continue;
+        }
+        let mut at = 0usize;
+        for (i, component) in components.iter().enumerate() {
+            at = match nodes[at].children.get(component) {
+                Some(&next) => next,
+                None => {
+                    let next = nodes.len();
+                    nodes.push(RuleNode {
+                        components: components[..=i].to_vec(),
+                        children: BTreeMap::new(),
+                        decision: None,
+                        decided_by: None,
+                        created_by: pattern,
+                    });
+                    nodes[at].children.insert(component, next);
+                    next
+                }
+            };
+        }
+        // Two patterns naming the same path: the later one wins, which is what
+        // writing them in turn already did.
+        nodes[at].decision = Some(*allow);
+        nodes[at].decided_by = Some(pattern);
+    }
+
+    let mut out = Vec::new();
+    let mut conflicts = Vec::new();
+
+    // Depth-first, carrying the nearest ancestor-or-self decision.
+    let mut stack: Vec<(usize, Option<(bool, &str)>)> = vec![(0, None)];
+    while let Some((index, inherited)) = stack.pop() {
+        let effective = match (nodes[index].decision, nodes[index].decided_by) {
+            (Some(d), Some(by)) => Some((d, by)),
+            _ => inherited,
+        };
+
+        let has_children = !nodes[index].children.is_empty();
+        let state = state_after(role_id, &nodes[index].components);
+
+        // A node that still has to be walked through carries its decision at
+        // the wildcard slot, so siblings the deeper patterns do not name keep
+        // getting it.
+        if has_children {
+            if let Some((decision, by)) = effective {
+                if let Some(star) = nodes[index].children.get("*") {
+                    conflicts.push(format!(
+                        "'{}' and '{}' overlap at a '*' component, which cannot hold both a \
+                         wildcard transition and an inherited decision; rewrite one so neither \
+                         is a prefix of the other",
+                        by, nodes[*star].created_by
+                    ));
+                } else {
+                    out.push((
+                        path_state_key(role_id, state, 0),
+                        path_state_value(terminal_state(decision), true, decision, true),
+                    ));
+                }
+            }
+        }
+
+        for (component, &child) in &nodes[index].children {
+            let child_state = state_after(role_id, &nodes[child].components);
+            let hash = if *component == "*" {
+                0
+            } else {
+                fnv1a_hash_u64(component)
+            };
+            let child_has_children = !nodes[child].children.is_empty();
+
+            let value = if child_has_children {
+                path_state_value(child_state, false, false, *component == "*")
+            } else {
+                // A leaf exists because a pattern ended there, so it has a
+                // decision.
+                let decision = nodes[child].decision.unwrap_or(false);
+                path_state_value(terminal_state(decision), true, decision, *component == "*")
+            };
+            out.push((path_state_key(role_id, state, hash), value));
+            stack.push((child, effective));
+        }
+    }
+
+    if conflicts.is_empty() {
+        Ok(out)
+    } else {
+        conflicts.sort();
+        conflicts.dedup();
+        Err(conflicts)
+    }
+}
+
+/// The sentinel a terminal transition carries in `next_state`.
+fn terminal_state(allow: bool) -> u64 {
+    if allow {
+        PATH_STATE_ACCEPT
+    } else {
+        PATH_STATE_REJECT
+    }
 }
 
 /// `struct net_rule_key { u32 role_id; u16 port; u8 protocol; u8 direction; }`
@@ -824,8 +999,9 @@ mod path_walk_semantics {
         walk(&rules(7, patterns), 7, path, false)
     }
 
-    /// Two patterns where one is a prefix of the other collide, and the more
-    /// specific one silently destroys the broader.
+    /// The mechanism behind the bug [`path_state_entries_for_role`] exists to
+    /// fix. Kept because the per-pattern encoder still exists and this is why
+    /// no loader may use it for more than one pattern of a role.
     ///
     /// "/usr/**" drops the "**" and is a single component: a TERMINAL allow at
     /// (role, state 0, hash("usr")). "/usr/bin/**" writes that same key as a
@@ -928,6 +1104,236 @@ mod path_walk_semantics {
     // catch a regression made only in main.bpf.c. They state what the fixed
     // collection side is required to produce.
     // ---------------------------------------------------------------------
+
+    /// Encode a whole rule list the way the loaders now do, and walk it.
+    fn merged(role: u32, rules: &[(&str, bool)]) -> HashMap<[u8; 24], [u8; 16]> {
+        let mut map = HashMap::new();
+        for (k, v) in path_state_entries_for_role(role, rules).expect("no conflicts expected") {
+            map.insert(k, v);
+        }
+        map
+    }
+
+    fn decide_merged(rules: &[(&str, bool)], path: &str) -> Decision {
+        walk(&merged(7, rules), 7, path, false)
+    }
+
+    /// Allow a directory, deny one file inside it -- the most natural way a
+    /// policy is written, and the shape `wildcard_test` ships.
+    ///
+    /// Encoded one pattern at a time this produced NEITHER rule: the deny
+    /// rewrote the allow's terminal as a transition, so anything else under the
+    /// directory reached a state with nothing beneath it. Reversed, the allow
+    /// overwrote the deny and the explicit deny was gone instead.
+    #[test]
+    fn a_directory_allow_and_a_file_deny_inside_it_both_apply() {
+        for rules in [
+            &[("/var/log/", true), ("/var/log/secure", false)][..],
+            &[("/var/log/secure", false), ("/var/log/", true)][..],
+        ] {
+            assert_eq!(
+                decide_merged(rules, "/var/log/messages"),
+                Decision::Allow,
+                "the directory allow must survive, order {rules:?}"
+            );
+            assert_eq!(
+                decide_merged(rules, "/var/log/secure"),
+                Decision::Deny,
+                "the file deny must survive, order {rules:?}"
+            );
+            assert_eq!(decide_merged(rules, "/var/log"), Decision::Allow);
+        }
+    }
+
+    /// The control for the test above: the same rules encoded one pattern at a
+    /// time, which is what the loaders did before, lose one of the two.
+    ///
+    /// Without this the tests above would pass whether or not the encoder was
+    /// actually fixed -- they would only be asserting that a correct policy
+    /// behaves correctly.
+    #[test]
+    fn encoding_one_pattern_at_a_time_is_what_loses_a_rule() {
+        let forward = &[("/var/log/", true), ("/var/log/secure", false)][..];
+        assert_eq!(
+            walk(&rules(7, forward), 7, "/var/log/messages", false),
+            Decision::NoRule,
+            "the deny overwrote the directory allow, so nothing decides this"
+        );
+
+        let reversed = &[("/var/log/secure", false), ("/var/log/", true)][..];
+        assert_eq!(
+            walk(&rules(7, reversed), 7, "/var/log/secure", false),
+            Decision::Allow,
+            "reversed, the allow overwrote the deny -- the fail-open direction"
+        );
+
+        // And the merged encoder disagrees with both, which is the fix.
+        assert_eq!(decide_merged(forward, "/var/log/messages"), Decision::Allow);
+        assert_eq!(decide_merged(reversed, "/var/log/secure"), Decision::Deny);
+    }
+
+    /// Inheritance has to be transitive: a deeper pattern forces a state at
+    /// every component it names, and the broader decision must reach each of
+    /// them, not just the first.
+    #[test]
+    fn a_broad_allow_still_covers_what_a_deeper_rule_does_not_name() {
+        let rules = &[("/usr/**", true), ("/usr/lib/syslog-ng/**", true)][..];
+
+        assert_eq!(decide_merged(rules, "/usr/bin/cat"), Decision::Allow);
+        assert_eq!(decide_merged(rules, "/usr/lib/other"), Decision::Allow);
+        assert_eq!(
+            decide_merged(rules, "/usr/lib/syslog-ng/x"),
+            Decision::Allow
+        );
+    }
+
+    /// The same bug in exec rules, where it is a fail-open: with the deny
+    /// written first the allow erased it, and a binary the policy refuses ran.
+    #[test]
+    fn a_deny_is_not_erased_by_a_carve_out_beneath_it() {
+        for rules in [
+            &[("/usr/bin/**", false), ("/usr/bin/git/**", true)][..],
+            &[("/usr/bin/git/**", true), ("/usr/bin/**", false)][..],
+        ] {
+            assert_eq!(
+                decide_merged(rules, "/usr/bin/curl"),
+                Decision::Deny,
+                "the deny must survive, order {rules:?}"
+            );
+            assert_eq!(
+                decide_merged(rules, "/usr/bin/git/git-remote"),
+                Decision::Allow,
+                "the carve-out must apply, order {rules:?}"
+            );
+        }
+    }
+
+    /// Deepest wins, not first-written.
+    #[test]
+    fn the_most_specific_rule_decides_at_every_depth() {
+        let rules = &[("/a/**", true), ("/a/b/**", false), ("/a/b/c/**", true)][..];
+
+        assert_eq!(decide_merged(rules, "/a/x"), Decision::Allow);
+        assert_eq!(decide_merged(rules, "/a/b/x"), Decision::Deny);
+        assert_eq!(decide_merged(rules, "/a/b/c/x"), Decision::Allow);
+    }
+
+    /// A `*` component and an inherited decision both want key `(state, 0)`.
+    /// Refused, naming both patterns, rather than dropping one silently.
+    #[test]
+    fn a_star_component_under_a_broader_rule_is_refused() {
+        let err = path_state_entries_for_role(
+            7,
+            &[("/tmp/mixed/", true), ("/tmp/mixed/*/data.txt", false)],
+        )
+        .expect_err("cannot hold a wildcard transition and a decision at one key");
+
+        assert_eq!(err.len(), 1);
+        assert!(
+            err[0].contains("/tmp/mixed/"),
+            "names the broader: {}",
+            err[0]
+        );
+        assert!(
+            err[0].contains("/tmp/mixed/*/data.txt"),
+            "names the deeper: {}",
+            err[0]
+        );
+    }
+
+    /// A `*` that nothing overlaps is still fine.
+    #[test]
+    fn a_star_on_its_own_is_not_a_conflict() {
+        let entries = path_state_entries_for_role(7, &[("/home/*/.ssh", false)])
+            .expect("no overlap, no conflict");
+        assert!(!entries.is_empty());
+    }
+
+    /// For a role whose patterns do not overlap, the merged encoder must not
+    /// change what reaches the kernel.
+    ///
+    /// Not byte-identical: the per-pattern encoder also emits a trailing entry
+    /// keyed on the ACCEPT/REJECT sentinel as its state, which the walk can
+    /// never reach -- it returns at the terminal that produced that sentinel.
+    /// The merged encoder omits those. Every entry it DOES emit must match.
+    #[test]
+    fn a_role_without_overlap_encodes_exactly_as_before() {
+        let rules = &[
+            ("/etc/shadow", false),
+            ("/var/www/", true),
+            ("/opt/app/bin/run", true),
+        ][..];
+
+        let mut per_pattern = std::collections::HashMap::new();
+        for (pattern, allow) in rules {
+            for (k, v) in path_state_entries(7, pattern, *allow) {
+                per_pattern.insert(k, v);
+            }
+        }
+
+        let merged_entries = path_state_entries_for_role(7, rules).expect("no conflicts");
+        assert!(!merged_entries.is_empty());
+
+        // Compared on the fields the walk reads. The per-pattern encoder also
+        // writes the pattern's `allow` into NON-terminal entries, where
+        // check_path_state_machine never looks at it -- it reads `decision`
+        // only when `is_terminal` is set. The merged encoder leaves that byte
+        // zero rather than pick one of several patterns' values for a node they
+        // all pass through.
+        for (k, v) in &merged_entries {
+            let before = per_pattern.get(k).expect("same key set");
+            assert_eq!(&v[0..8], &before[0..8], "next_state differs");
+            assert_eq!(v[8], before[8], "is_terminal differs");
+            assert_eq!(v[10], before[10], "wildcard differs");
+            if v[8] == 1 {
+                assert_eq!(v[9], before[9], "terminal decision differs");
+            }
+        }
+
+        // The only entries left over are the unreachable sentinel-keyed ones.
+        let merged_keys: std::collections::HashSet<_> =
+            merged_entries.iter().map(|(k, _)| *k).collect();
+        for k in per_pattern.keys() {
+            if merged_keys.contains(k) {
+                continue;
+            }
+            let state = u64::from_ne_bytes(k[8..16].try_into().unwrap());
+            assert!(
+                state == PATH_STATE_ACCEPT || state == PATH_STATE_REJECT,
+                "the merged encoder dropped a reachable entry"
+            );
+        }
+    }
+
+    /// The shipped policy must load. `wildcard_test` is the role that carried
+    /// the bug, and it must not now be refused instead.
+    #[test]
+    fn the_shipped_policy_has_no_refused_combination() {
+        const POLICY: &str = include_str!("../../config/policy.json");
+        let v: serde_json::Value = serde_json::from_str(POLICY).expect("valid json");
+
+        let roles = v["roles"].as_object().expect("roles object");
+        for (name, role) in roles {
+            let id = role["id"].as_u64().unwrap_or(0) as u32;
+            for section in ["file_paths", "execution_rules"] {
+                let Some(list) = role[section].as_array() else {
+                    continue;
+                };
+                let key = if section == "file_paths" {
+                    "pattern"
+                } else {
+                    "binary_path"
+                };
+                let rules: Vec<(&str, bool)> = list
+                    .iter()
+                    .filter_map(|r| Some((r[key].as_str()?, r["allow"].as_bool().unwrap_or(true))))
+                    .collect();
+                if let Err(conflicts) = path_state_entries_for_role(id, &rules) {
+                    panic!("role '{name}' {section} would be refused: {conflicts:?}");
+                }
+            }
+        }
+    }
 
     /// The role-flag fallback from `file_open`: `if (!(*flags & 0x01)) return
     /// -13;`. So `NoRule` is an allow for any role with `allow_file_access`

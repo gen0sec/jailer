@@ -337,15 +337,44 @@ impl AllowedDomains {
 /// process's memory at `bprm` time and is not readable in any way worth
 /// trusting. A rule that sets it would silently match on the path alone, which
 /// is broader than what was written.
-pub fn unenforced_settings(role: &Role) -> Vec<&'static str> {
-    let mut out = crate::flags::unenforced_flags(&role.flags);
+pub fn unenforced_settings(role: &Role) -> Vec<String> {
+    let mut out: Vec<String> = crate::flags::unenforced_flags(&role.flags)
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     if role
         .execution_rules
         .iter()
         .any(|r| r.args_pattern.is_some())
     {
-        out.push("execution_rules.args_pattern");
+        out.push("execution_rules.args_pattern".to_string());
+    }
+
+    // Patterns that overlap in a way the encoder cannot express. Everything
+    // else composes -- the broader rule is inherited by the nodes a deeper one
+    // creates -- but a `*` component and an inherited decision both need the
+    // same key, so that pair is refused rather than half-applied.
+    let files: Vec<(&str, bool)> = role
+        .file_paths
+        .iter()
+        .map(|p| (p.pattern.as_str(), p.allow))
+        .collect();
+    if let Err(conflicts) = crate::codec::path_state_entries_for_role(role.id.0, &files) {
+        out.extend(conflicts.into_iter().map(|c| format!("file_paths: {c}")));
+    }
+
+    let execs: Vec<(&str, bool)> = role
+        .execution_rules
+        .iter()
+        .map(|e| (e.binary_path.as_str(), e.allow))
+        .collect();
+    if let Err(conflicts) = crate::codec::path_state_entries_for_role(role.id.0, &execs) {
+        out.extend(
+            conflicts
+                .into_iter()
+                .map(|c| format!("execution_rules: {c}")),
+        );
     }
 
     out
@@ -402,6 +431,47 @@ mod tests {
         );
     }
 
+    /// A `*` under a broader rule cannot be encoded, so the policy is refused
+    /// rather than applied with one of the two rules missing.
+    #[test]
+    fn overlapping_patterns_that_cannot_be_encoded_are_refused() {
+        let mut r = role(1, "web");
+        r.flags.allow_setuid = true;
+        r.file_paths = vec![
+            PathPattern {
+                pattern: "/tmp/mixed/".into(),
+                allow: true,
+            },
+            PathPattern {
+                pattern: "/tmp/mixed/*/data.txt".into(),
+                allow: false,
+            },
+        ];
+        let out = unenforced_settings(&r);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert!(out[0].starts_with("file_paths: "), "{}", out[0]);
+        assert!(out[0].contains("/tmp/mixed/*/data.txt"), "{}", out[0]);
+    }
+
+    /// Overlaps the encoder CAN express must not be refused -- that is the
+    /// whole point of the fix, and it is the shape the shipped policy uses.
+    #[test]
+    fn a_directory_allow_with_a_file_deny_inside_it_is_accepted() {
+        let mut r = role(1, "web");
+        r.flags.allow_setuid = true;
+        r.file_paths = vec![
+            PathPattern {
+                pattern: "/var/log/".into(),
+                allow: true,
+            },
+            PathPattern {
+                pattern: "/var/log/secure".into(),
+                allow: false,
+            },
+        ];
+        assert!(unenforced_settings(&r).is_empty());
+    }
+
     /// One rule out of many is enough to refuse the policy: the others being
     /// fine does not make the unenforceable one safe.
     #[test]
@@ -429,7 +499,10 @@ mod tests {
         r.execution_rules = vec![exec_rule("/usr/bin/curl", Some("x"))];
         assert_eq!(
             unenforced_settings(&r),
-            vec!["require_signed_binary", "execution_rules.args_pattern"]
+            vec![
+                "require_signed_binary".to_string(),
+                "execution_rules.args_pattern".to_string()
+            ]
         );
     }
 

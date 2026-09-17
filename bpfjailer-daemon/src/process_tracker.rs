@@ -1,5 +1,6 @@
 use crate::bpf_loader::BpfJailerBpf;
 use anyhow::{Context, Result};
+use bpfjailer_common::codec::PathStateEntry;
 use bpfjailer_common::{NetworkRule, PathPattern, PodId, PolicyFlags, ProxyConfig, RoleId};
 use log::{debug, info, warn};
 use std::sync::Arc;
@@ -134,35 +135,44 @@ impl ProcessTracker {
         Ok(())
     }
 
-    /// Add a path state (dentry-walking state machine)
-    pub fn add_path_state(&self, role_id: RoleId, pattern: &str, allowed: bool) -> Result<()> {
-        self.bpf
-            .add_path_state(role_id.0, pattern, allowed)
-            .context("Failed to add path state")
-    }
-
-    /// Apply path rules from a Role definition using state machine
+    /// Apply a role's path rules, encoded as a set.
+    ///
+    /// Every enrollment re-applies the role's rules through here, so this route
+    /// carried the same defect `apply_role` did: written one pattern at a time,
+    /// two patterns where one is a prefix of the other share a key and the
+    /// later erased the earlier.
+    ///
+    /// It also normalised patterns itself -- trimming `/**` and `/*` to a
+    /// trailing slash -- which disagreed with `codec::pattern_components`: it
+    /// turned `/tmp/*` ("one component under /tmp") into `/tmp/` ("everything
+    /// under /tmp"), so the same policy meant different things depending on
+    /// whether it was applied at startup or at enrollment. The patterns now go
+    /// to the encoder as written, and the two routes agree.
     pub fn apply_path_rules(&self, role_id: RoleId, rules: &[PathPattern]) -> Result<()> {
-        for rule in rules {
-            // Normalize path - ensure directory prefixes end with /
-            let path = if rule.pattern.ends_with("/**") {
-                // Convert glob pattern to prefix
-                rule.pattern.trim_end_matches("**").to_string()
-            } else if rule.pattern.ends_with("/*") {
-                rule.pattern.trim_end_matches('*').to_string()
-            } else {
-                rule.pattern.clone()
-            };
+        let encoded: Vec<(&str, bool)> = rules
+            .iter()
+            .map(|r| (r.pattern.as_str(), r.allow))
+            .collect();
 
-            // Use state machine approach (dentry walking)
-            self.add_path_state(role_id, &path, rule.allow)?;
-
-            info!(
-                "Applied path rule: role={} path=\"{}\" allow={}",
-                role_id.0, path, rule.allow
-            );
+        match bpfjailer_common::codec::path_state_entries_for_role(role_id.0, &encoded) {
+            Ok(entries) => {
+                self.bpf
+                    .write_states("path_states", &entries)
+                    .context("Failed to write path states")?;
+                info!(
+                    "Applied {} path rules for role {} ({} transitions)",
+                    rules.len(),
+                    role_id.0,
+                    entries.len()
+                );
+                Ok(())
+            }
+            Err(conflicts) => Err(anyhow::anyhow!(
+                "role {} has overlapping path patterns: {}",
+                role_id.0,
+                conflicts.join("; ")
+            )),
         }
-        Ok(())
     }
 
     // =========================================================================
@@ -210,11 +220,11 @@ impl bpfjailer_common::apply::PolicySink for TrackerSink<'_> {
     fn set_role_flags(&mut self, role_id: u32, flags: u8) -> Result<()> {
         self.0.bpf.update_role_flags(role_id, flags)
     }
-    fn add_path_state(&mut self, role_id: u32, pattern: &str, allow: bool) -> Result<()> {
-        self.0.bpf.add_path_state(role_id, pattern, allow)
+    fn write_path_states(&mut self, _role_id: u32, entries: &[PathStateEntry]) -> Result<()> {
+        self.0.bpf.write_states("path_states", entries)
     }
-    fn add_exec_state(&mut self, role_id: u32, pattern: &str, allow: bool) -> Result<()> {
-        self.0.bpf.add_exec_state(role_id, pattern, allow)
+    fn write_exec_states(&mut self, _role_id: u32, entries: &[PathStateEntry]) -> Result<()> {
+        self.0.bpf.write_states("exec_states", entries)
     }
     fn add_network_rule(
         &mut self,
@@ -419,10 +429,16 @@ mod root_integration {
 
     #[test]
     #[ignore = "requires root"]
-    fn add_path_state_is_accepted() {
+    fn applying_path_rules_is_accepted() {
         let t = tracker_or_skip!();
-        t.add_path_state(RoleId(26), "/srv/data/", false)
-            .expect("state");
+        t.apply_path_rules(
+            RoleId(26),
+            &[PathPattern {
+                pattern: "/srv/data/".into(),
+                allow: false,
+            }],
+        )
+        .expect("state");
     }
 
     #[test]

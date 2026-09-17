@@ -862,13 +862,22 @@ mod root_integration {
 
     #[test]
     #[ignore = "requires root"]
-    fn directory_pattern_adds_the_trailing_wildcard_transition() {
+    /// A directory pattern's decision lands on its final component, and covers
+    /// everything beneath it because the walk returns at the first terminal.
+    ///
+    /// This used to assert the trailing entry the per-pattern encoder adds for
+    /// a pattern ending in "/" -- but that entry is keyed on the ACCEPT/REJECT
+    /// sentinel as its state, which the walk never uses as a state, so it was
+    /// never reachable. The role-level encoder does not write it.
+    fn directory_pattern_terminates_on_its_last_component() {
         let b = bpf_or_skip!();
         write_role(&b, 8, &[("/var/secrets/", false)]);
-        let entries = codec::path_state_entries(8, "/var/secrets/", false);
+        let entries =
+            codec::path_state_entries_for_role(8, &[("/var/secrets/", false)]).expect("encodes");
         let last = entries.last().expect("at least one entry");
-        let got = lookup(&b, "path_states", &last.0).expect("wildcard terminal present");
-        assert_eq!(got[10], 1, "wildcard flag set in the stored value");
+        let got = lookup(&b, "path_states", &last.0).expect("terminal present");
+        assert_eq!(got[8], 1, "terminal flag set in the stored value");
+        assert_eq!(got[9], 0, "and it denies");
     }
 
     #[test]

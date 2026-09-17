@@ -570,12 +570,39 @@ mod root_integration {
                 .expect("no conflicts");
         sink.write_path_states(31, &entries).expect("write");
         let map = map_by_name(&object, "path_states").expect("map");
-        for (key, value) in bpfjailer_common::codec::path_state_entries(31, "/srv/data/", false) {
+
+        // Everything the role-level encoder produced is in the map.
+        for (key, value) in &entries {
             let got = map
-                .lookup(&key, MapFlags::empty())
+                .lookup(key, MapFlags::empty())
                 .expect("lookup")
                 .expect("present");
             assert_eq!(got.as_slice(), value.as_slice());
+        }
+
+        // The per-pattern encoder additionally emits a trailing entry keyed on
+        // the ACCEPT/REJECT sentinel AS ITS STATE. The walk returns at the
+        // terminal that produces that sentinel, so it never looks a key like
+        // that up -- the entry is unreachable, and the role-level encoder does
+        // not write it. Assert here, against a real map, that the only thing
+        // missing is exactly that.
+        let written: std::collections::HashSet<_> = entries.iter().map(|(k, _)| *k).collect();
+        for (key, _) in bpfjailer_common::codec::path_state_entries(31, "/srv/data/", false) {
+            if written.contains(&key) {
+                continue;
+            }
+            let state = u64::from_ne_bytes(key[8..16].try_into().unwrap());
+            assert!(
+                state == bpfjailer_common::codec::PATH_STATE_ACCEPT
+                    || state == bpfjailer_common::codec::PATH_STATE_REJECT,
+                "a reachable transition is missing from the map"
+            );
+            assert!(
+                map.lookup(&key, MapFlags::empty())
+                    .expect("lookup")
+                    .is_none(),
+                "the unreachable entry should not have been written"
+            );
         }
     }
 }

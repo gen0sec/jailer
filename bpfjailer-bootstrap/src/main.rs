@@ -9,6 +9,7 @@ use bpfjailer_common::codec;
 use bpfjailer_common::policy::PolicyConfig;
 use libbpf_rs::MapCore;
 use libbpf_rs::{Link, MapFlags, Object, ObjectBuilder};
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -51,11 +52,39 @@ fn main() {
 fn run() -> Result<()> {
     log::info!("BpfJailer bootstrap starting...");
 
-    // Check if already pinned
-    if is_pinned() {
-        log::info!("BPF programs already pinned at {}", BPF_PIN_PATH);
-        log::info!("To reload, remove {} and rerun", BPF_PIN_PATH);
-        return Ok(());
+    // What is already pinned, and is it what this build would load?
+    //
+    // This used to be `Path::new(BPF_PIN_PATH).exists()` followed by a success
+    // return, so a newly installed build on a host where an older one had run
+    // never loaded, attached or pinned anything -- and reported success while
+    // doing it. An added program or map simply was not there, silently, with
+    // exit 0 and a populated pin directory as evidence that it was.
+    let object_path = bpf_object_path()?;
+    let build_id = build_id_of(&object_path)?;
+    let found = read_pin_state(Path::new(BPF_PIN_PATH), Path::new(BUILD_ID_PATH));
+
+    match compare(&found, build_id) {
+        PinVerdict::Absent => {}
+        PinVerdict::Current => {
+            log::info!(
+                "BPF programs already pinned at {}, and they are this build's",
+                BPF_PIN_PATH
+            );
+            log::info!("To reload, remove {} and rerun", BPF_PIN_PATH);
+            return Ok(());
+        }
+        PinVerdict::Stale(differences) => {
+            for d in &differences {
+                log::error!("  {}", d);
+            }
+            anyhow::bail!(
+                "{} holds a pin this build did not create, so what is enforcing is not \
+                 what this binary would load. Nothing was changed. Remove {} and rerun, \
+                 or reboot -- these pins do not survive one.",
+                BPF_PIN_PATH,
+                BPF_PIN_PATH
+            );
+        }
     }
 
     // Load policy
@@ -69,15 +98,136 @@ fn run() -> Result<()> {
     populate_maps(&mut object, &policy)?;
 
     // Pin maps and programs
-    pin_all(&mut object, &mut links)?;
+    pin_all(&mut object, &mut links, build_id)?;
 
     log::info!("BpfJailer bootstrap complete - programs pinned and active");
     log::info!("Programs will remain active until reboot");
     Ok(())
 }
 
-fn is_pinned() -> bool {
-    Path::new(BPF_PIN_PATH).exists()
+/// Where the id of the pinned build is recorded.
+///
+/// `/run/bpfjailer/` is already this project's runtime directory -- the
+/// daemon's enrollment socket lives there -- and it shares the pins' lifetime,
+/// since both it and bpffs are cleared at boot. So the id cannot outlive the
+/// pins it describes.
+///
+/// Not a BPF map: `bpf_contract` fails any declared map that no BPF program
+/// reads, and a build id is read by none. Working around that guard to store
+/// one would be the wrong trade.
+const BUILD_ID_PATH: &str = "/run/bpfjailer/build-id";
+
+/// What the pin directory currently holds.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PinState {
+    progs: BTreeSet<String>,
+    maps: BTreeSet<String>,
+    build_id: Option<String>,
+}
+
+/// Whether what is pinned is what this build would load.
+#[derive(Debug, PartialEq, Eq)]
+enum PinVerdict {
+    /// Nothing pinned: load normally.
+    Absent,
+    /// Pinned, and it is this build's.
+    Current,
+    /// Pinned by something else, with the differences named.
+    Stale(Vec<String>),
+}
+
+/// Read the pin directory. Takes its paths so this is testable without bpffs.
+fn read_pin_state(pin_dir: &Path, build_id_path: &Path) -> PinState {
+    fn names(dir: &Path) -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    PinState {
+        progs: names(&pin_dir.join("progs")),
+        maps: names(&pin_dir.join("maps")),
+        build_id: fs::read_to_string(build_id_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    }
+}
+
+/// Compare what is pinned against what this build would load.
+///
+/// Absent only when nothing at all is pinned. Anything partially pinned is
+/// stale, not absent: a half-populated directory is precisely the state the old
+/// check could not tell from a good one.
+fn compare(found: &PinState, expected_build_id: u64) -> PinVerdict {
+    if found.progs.is_empty() && found.maps.is_empty() && found.build_id.is_none() {
+        return PinVerdict::Absent;
+    }
+
+    let expected = format!("{expected_build_id:016x}");
+    let mut differences = Vec::new();
+
+    let want_progs: BTreeSet<String> = bpfjailer_common::programs::LSM_PROGRAMS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let want_maps: BTreeSet<String> = bpfjailer_common::maps::PINNED_MAPS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let describe = |label: &str, missing: Vec<&String>, extra: Vec<&String>| {
+        let mut out = Vec::new();
+        if !missing.is_empty() {
+            out.push(format!("{label} pinned but missing: {missing:?}"));
+        }
+        if !extra.is_empty() {
+            out.push(format!(
+                "{label} pinned that this build does not load: {extra:?}"
+            ));
+        }
+        out
+    };
+
+    differences.extend(describe(
+        "programs",
+        want_progs.difference(&found.progs).collect(),
+        found.progs.difference(&want_progs).collect(),
+    ));
+    differences.extend(describe(
+        "maps",
+        want_maps.difference(&found.maps).collect(),
+        found.maps.difference(&want_maps).collect(),
+    ));
+
+    match &found.build_id {
+        Some(id) if *id == expected => {}
+        Some(id) => differences.push(format!(
+            "build id is {id}, this build's object is {expected}"
+        )),
+        None => differences.push(format!(
+            "no build id recorded at {BUILD_ID_PATH}, so an older build pinned these"
+        )),
+    }
+
+    if differences.is_empty() {
+        PinVerdict::Current
+    } else {
+        PinVerdict::Stale(differences)
+    }
+}
+
+/// Identify the object on disk. See `bpfjailer_common::hash::fnv1a_digest` for
+/// why this is not a cryptographic hash.
+fn build_id_of(path: &Path) -> Result<u64> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("Failed to read BPF object at {}", path.display()))?;
+    Ok(bpfjailer_common::hash::fnv1a_digest(&bytes))
 }
 
 fn load_policy() -> Result<PolicyConfig> {
@@ -118,9 +268,11 @@ fn load_policy() -> Result<PolicyConfig> {
     Ok(config)
 }
 
-fn load_bpf_object() -> Result<(Object, Vec<Link>)> {
-    log::info!("Loading BPF programs...");
-
+/// Where the compiled object is, searched installed-first.
+///
+/// Extracted so the build id can be taken from the same file the loader will
+/// open -- hashing a different copy would defeat the point.
+fn bpf_object_path() -> Result<PathBuf> {
     let workspace_root = std::env::var("CARGO_MANIFEST_DIR")
         .ok()
         .map(PathBuf::from)
@@ -138,15 +290,21 @@ fn load_bpf_object() -> Result<(Object, Vec<Link>)> {
         PathBuf::from("target/bpfel-unknown-none/debug/bpfjailer.bpf.o"),
     ];
 
-    let obj_path = possible_paths
-        .iter()
+    possible_paths
+        .into_iter()
         .find(|p| p.exists())
-        .ok_or_else(|| anyhow::anyhow!("bpfjailer.bpf.o not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("bpfjailer.bpf.o not found"))
+}
+
+fn load_bpf_object() -> Result<(Object, Vec<Link>)> {
+    log::info!("Loading BPF programs...");
+
+    let obj_path = bpf_object_path()?;
 
     log::info!("Loading BPF object from: {:?}", obj_path);
 
     let mut object_builder = ObjectBuilder::default();
-    let open_object = object_builder.open_file(obj_path)?;
+    let open_object = object_builder.open_file(&obj_path)?;
     let object = open_object.load().context("Failed to load BPF object")?;
 
     log::info!("BPF object loaded successfully");
@@ -355,7 +513,13 @@ fn populate_maps(object: &mut Object, policy: &PolicyConfig) -> Result<()> {
     Ok(())
 }
 
-fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
+/// Pin everything, and fail if any of it does not land.
+///
+/// Each pin failure used to be a `log::warn!`. Pinning exists so the objects
+/// survive this process exiting, so a pin that failed means the thing is not
+/// there -- and the caller could not tell, which is how the directory came to
+/// be an unreliable record of what is attached.
+fn pin_all(object: &mut Object, links: &mut [Link], build_id: u64) -> Result<()> {
     log::info!("Pinning BPF programs and maps to {}...", BPF_PIN_PATH);
 
     // Create pin directory
@@ -375,14 +539,12 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
     let map_names = bpfjailer_common::maps::PINNED_MAPS;
 
     for name in map_names {
-        if let Some(mut map) = map_mut_by_name(object, name) {
-            let pin_path = format!("{}/{}", maps_dir, name);
-            if let Err(e) = map.pin(&pin_path) {
-                log::warn!("Failed to pin map {}: {}", name, e);
-            } else {
-                log::info!("Pinned map: {}", name);
-            }
-        }
+        let mut map = map_mut_by_name(object, name)
+            .ok_or_else(|| anyhow::anyhow!("map {} is not in the loaded object", name))?;
+        let pin_path = format!("{}/{}", maps_dir, name);
+        map.pin(&pin_path)
+            .with_context(|| format!("Failed to pin map {name}"))?;
+        log::info!("Pinned map: {}", name);
     }
 
     // Pin all programs
@@ -391,27 +553,42 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
     let prog_names = bpfjailer_common::programs::LSM_PROGRAMS;
 
     for name in prog_names {
-        if let Some(mut prog) = prog_by_name(object, name) {
-            let pin_path = format!("{}/{}", progs_dir, name);
-            if let Err(e) = prog.pin(&pin_path) {
-                log::warn!("Failed to pin program {}: {}", name, e);
-            } else {
-                log::info!("Pinned program: {}", name);
-            }
-        }
+        let mut prog = prog_by_name(object, name)
+            .ok_or_else(|| anyhow::anyhow!("program {} is not in the loaded object", name))?;
+        let pin_path = format!("{}/{}", progs_dir, name);
+        prog.pin(&pin_path)
+            .with_context(|| format!("Failed to pin program {name}"))?;
+        log::info!("Pinned program: {}", name);
     }
 
     // Pin links to keep programs attached
     for (i, link) in links.iter_mut().enumerate() {
         let pin_path = format!("{}/link_{}", links_dir, i);
-        if let Err(e) = link.pin(&pin_path) {
-            log::warn!("Failed to pin link {}: {}", i, e);
-        } else {
-            log::info!("Pinned link: {}", i);
-        }
+        link.pin(&pin_path)
+            .with_context(|| format!("Failed to pin link {i}"))?;
+        log::info!("Pinned link: {}", i);
     }
 
+    // Last, so the id is only recorded once everything above actually landed.
+    // A pin directory with no id reads as stale on the next run, which is the
+    // safe direction: it means something pinned these that did not say what it
+    // was.
+    record_build_id(build_id)?;
+
     log::info!("All BPF objects pinned successfully");
+    Ok(())
+}
+
+/// Record which object is pinned, for the next run's comparison.
+fn record_build_id(build_id: u64) -> Result<()> {
+    let path = Path::new(BUILD_ID_PATH);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    fs::write(path, format!("{build_id:016x}"))
+        .with_context(|| format!("Failed to write {BUILD_ID_PATH}"))?;
+    log::info!("Recorded build id {:016x}", build_id);
     Ok(())
 }
 
@@ -422,22 +599,152 @@ fn pin_all(object: &mut Object, links: &mut [Link]) -> Result<()> {
 /// host rather than here. `populate_maps` only needs the maps to exist, so it
 /// is driven against an object that is loaded but never attached.
 #[cfg(test)]
+mod pin_staleness {
+    use super::*;
+
+    fn want() -> PinState {
+        PinState {
+            progs: bpfjailer_common::programs::LSM_PROGRAMS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            maps: bpfjailer_common::maps::PINNED_MAPS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            build_id: Some(format!("{:016x}", 0xabc123u64)),
+        }
+    }
+
+    #[test]
+    fn nothing_pinned_is_absent() {
+        assert_eq!(compare(&PinState::default(), 0xabc123), PinVerdict::Absent);
+    }
+
+    #[test]
+    fn everything_matching_is_current() {
+        assert_eq!(compare(&want(), 0xabc123), PinVerdict::Current);
+    }
+
+    /// The failure in the issue: a build that adds a program, run on a host
+    /// where an older one pinned.
+    #[test]
+    fn a_program_this_build_adds_is_stale() {
+        let mut found = want();
+        found.progs.remove("task_alloc");
+
+        let PinVerdict::Stale(diffs) = compare(&found, 0xabc123) else {
+            panic!("a missing program must not read as current");
+        };
+        assert!(
+            diffs.iter().any(|d| d.contains("task_alloc")),
+            "must name the program: {diffs:?}"
+        );
+    }
+
+    #[test]
+    fn a_map_this_build_adds_is_stale() {
+        let mut found = want();
+        found.maps.remove("exec_states");
+
+        let PinVerdict::Stale(diffs) = compare(&found, 0xabc123) else {
+            panic!("a missing map must not read as current");
+        };
+        assert!(diffs.iter().any(|d| d.contains("exec_states")), "{diffs:?}");
+    }
+
+    /// A pin from a build that had something this one dropped.
+    #[test]
+    fn a_pinned_name_this_build_does_not_load_is_stale() {
+        let mut found = want();
+        found.progs.insert("task_fix_setuid".to_string());
+
+        let PinVerdict::Stale(diffs) = compare(&found, 0xabc123) else {
+            panic!("an extra program must not read as current");
+        };
+        assert!(
+            diffs.iter().any(|d| d.contains("task_fix_setuid")),
+            "{diffs:?}"
+        );
+    }
+
+    /// The case names alone cannot catch: a rebuild where every program and map
+    /// is the same but the code changed.
+    #[test]
+    fn the_same_names_with_a_different_object_is_stale() {
+        let PinVerdict::Stale(diffs) = compare(&want(), 0xdeadbeef) else {
+            panic!("a different object must not read as current");
+        };
+        assert_eq!(diffs.len(), 1, "only the build id differs: {diffs:?}");
+        assert!(diffs[0].contains("build id"), "{}", diffs[0]);
+    }
+
+    /// Pins present with no id recorded: an older build put them there.
+    #[test]
+    fn pins_without_a_recorded_build_id_are_stale() {
+        let mut found = want();
+        found.build_id = None;
+
+        let PinVerdict::Stale(diffs) = compare(&found, 0xabc123) else {
+            panic!("an unidentified pin must not read as current");
+        };
+        assert!(diffs.iter().any(|d| d.contains("no build id")), "{diffs:?}");
+    }
+
+    /// A half-populated directory is stale, not absent -- telling those apart
+    /// is the whole point.
+    #[test]
+    fn a_partially_pinned_directory_is_stale_not_absent() {
+        let found = PinState {
+            progs: ["task_alloc".to_string()].into_iter().collect(),
+            maps: BTreeSet::new(),
+            build_id: None,
+        };
+        assert!(matches!(compare(&found, 0xabc123), PinVerdict::Stale(_)));
+    }
+
+    /// The reader takes its paths, so this needs no bpffs and no root.
+    #[test]
+    fn the_reader_reports_what_is_on_disk() {
+        let base = std::env::temp_dir().join(format!("bpfjailer-pin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("progs")).expect("mkdir");
+        fs::create_dir_all(base.join("maps")).expect("mkdir");
+        fs::write(base.join("progs/file_open"), b"").expect("write");
+        fs::write(base.join("maps/path_states"), b"").expect("write");
+        let id_path = base.join("build-id");
+        fs::write(&id_path, "00000000000abc123\n").expect("write");
+
+        let found = read_pin_state(&base, &id_path);
+        assert!(found.progs.contains("file_open"));
+        assert!(found.maps.contains("path_states"));
+        assert_eq!(found.build_id.as_deref(), Some("00000000000abc123"));
+
+        // A missing directory reads as empty rather than panicking.
+        let missing = base.join("nope");
+        assert_eq!(
+            read_pin_state(&missing, &missing.join("x")),
+            PinState::default()
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
 mod root_integration {
     use super::*;
 
-    fn bpf_object_path() -> Option<std::path::PathBuf> {
-        let root = std::env::var("CARGO_MANIFEST_DIR")
-            .ok()
-            .map(PathBuf::from)?
-            .parent()?
-            .to_path_buf();
-        let p = root.join("bpfjailer-bpf/target/bpfel-unknown-none/release/bpfjailer.bpf.o");
-        p.exists().then_some(p)
+    /// The object the loader itself would open, so a test that hashes it and
+    /// the binary that pins it cannot disagree about which file is meant.
+    /// This used to be a second, narrower copy of the search.
+    fn test_object_path() -> Option<PathBuf> {
+        super::bpf_object_path().ok()
     }
 
     /// Load (but do not attach) the BPF object, so the maps exist.
     fn loaded_object() -> Option<Object> {
-        let path = bpf_object_path()?;
+        let path = test_object_path()?;
         let mut builder = libbpf_rs::ObjectBuilder::default();
         builder.open_file(path).ok()?.load().ok()
     }
@@ -465,11 +772,28 @@ mod root_integration {
       "cgroup_enrollments": []
     }"#;
 
+    /// Against the real pin path, whatever state the host is in: an object
+    /// that is not the pinned one must never read as current.
+    ///
+    /// This replaces a test that compared `is_pinned()` to the expression
+    /// `is_pinned()` was implemented as, which could not fail.
     #[test]
     #[ignore = "requires root"]
-    fn is_pinned_reflects_the_pin_directory() {
-        // Whatever the current state, the answer must match the filesystem.
-        assert_eq!(is_pinned(), Path::new(BPF_PIN_PATH).exists());
+    fn a_foreign_build_never_reads_as_current_against_the_real_pin_path() {
+        let found = read_pin_state(Path::new(BPF_PIN_PATH), Path::new(BUILD_ID_PATH));
+
+        // 0 is not a digest this build could produce for a non-empty object.
+        assert_ne!(
+            compare(&found, 0),
+            PinVerdict::Current,
+            "a build id that cannot be ours must not be accepted"
+        );
+
+        // And the real object agrees with itself.
+        if let Some(path) = test_object_path() {
+            let id = build_id_of(&path).expect("hash the object");
+            assert_eq!(build_id_of(&path).expect("again"), id, "digest is stable");
+        }
     }
 
     #[test]

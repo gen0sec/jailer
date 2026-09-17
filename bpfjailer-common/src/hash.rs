@@ -49,6 +49,28 @@ pub fn fnv1a_hash_u64(s: &str) -> u64 {
     hash.wrapping_mul(FNV1A64_PRIME)
 }
 
+/// FNV-1a (64-bit) over a whole byte slice, with no length cap.
+///
+/// **Not** the hash the BPF side matches against -- that is
+/// [`fnv1a_hash_u64`], which stops at [`MAX_HASH_LEN`] because it hashes one
+/// path component and must stay byte-for-byte identical to `hash_component()`
+/// in the BPF source. Feeding a file to that one would hash its first 64 bytes
+/// and call two different objects the same.
+///
+/// This is for identifying a build: whether the object on disk is the one a
+/// previous run pinned. That is an accident-detection problem, not an
+/// adversarial one -- anyone who can replace the object can also rewrite the
+/// record of which object it was -- so a 64-bit digest is enough and avoids a
+/// cryptographic dependency for it.
+pub fn fnv1a_digest(bytes: &[u8]) -> u64 {
+    let mut hash = FNV1A64_OFFSET_BASIS;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +138,30 @@ mod tests {
             fnv1a_hash_u64(&b),
             "inputs past MAX_HASH_LEN are truncated; see fn docs"
         );
+    }
+
+    #[test]
+    fn the_digest_reads_every_byte() {
+        // The capped component hash cannot tell these apart; the digest must.
+        let a = vec![b'x'; 200];
+        let mut b = vec![b'x'; 200];
+        b[199] = b'y';
+        assert_ne!(fnv1a_digest(&a), fnv1a_digest(&b));
+
+        let sa: String = a.iter().map(|c| *c as char).collect();
+        let sb: String = b.iter().map(|c| *c as char).collect();
+        assert_eq!(
+            fnv1a_hash_u64(&sa),
+            fnv1a_hash_u64(&sb),
+            "precondition: the capped hash stops at MAX_HASH_LEN"
+        );
+    }
+
+    #[test]
+    fn the_digest_is_deterministic_and_order_sensitive() {
+        assert_eq!(fnv1a_digest(b"abc"), fnv1a_digest(b"abc"));
+        assert_ne!(fnv1a_digest(b"abc"), fnv1a_digest(b"acb"));
+        assert_ne!(fnv1a_digest(b""), fnv1a_digest(b"\0"));
     }
 
     /// Independent restatement of the algorithm, so the test does not simply

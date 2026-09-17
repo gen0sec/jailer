@@ -12,6 +12,7 @@
 //! here once, where `apply_role_covers_every_enforcing_field` will
 //! notice if it is skipped.
 
+use crate::codec::PathStateEntry;
 use crate::flags::policy_flags_to_u8;
 use crate::policy::Role;
 use std::net::Ipv4Addr;
@@ -54,13 +55,23 @@ pub trait PolicySink {
     type Err;
 
     fn set_role_flags(&mut self, role_id: u32, flags: u8) -> Result<(), Self::Err>;
-    fn add_path_state(&mut self, role_id: u32, pattern: &str, allow: bool)
-        -> Result<(), Self::Err>;
-    /// An execution rule: the same path encoding as [`Self::add_path_state`],
-    /// written to the map the exec hook walks rather than the one the open
-    /// hook walks.
-    fn add_exec_state(&mut self, role_id: u32, pattern: &str, allow: bool)
-        -> Result<(), Self::Err>;
+    /// Write a role's already-encoded path transitions.
+    ///
+    /// Encoded, not patterns: a role's rules have to be encoded together, since
+    /// two patterns where one is a prefix of the other share a key and the
+    /// later write erases the earlier. [`crate::codec::path_state_entries_for_role`]
+    /// does that once, here, rather than in each sink.
+    fn write_path_states(
+        &mut self,
+        role_id: u32,
+        entries: &[PathStateEntry],
+    ) -> Result<(), Self::Err>;
+    /// The same, for the map the exec hook walks.
+    fn write_exec_states(
+        &mut self,
+        role_id: u32,
+        entries: &[PathStateEntry],
+    ) -> Result<(), Self::Err>;
     fn add_network_rule(
         &mut self,
         role_id: u32,
@@ -109,16 +120,38 @@ pub fn apply_role<S: PolicySink, R: DomainResolver + ?Sized>(
 
     sink.set_role_flags(role_id, policy_flags_to_u8(&role.flags))?;
 
-    for p in &role.file_paths {
-        sink.add_path_state(role_id, &p.pattern, p.allow)?;
+    // Encoded as a set, not one at a time: see `write_path_states`. A conflict
+    // is refused at load by `policy::unenforced_settings`, so reaching one here
+    // means something bypassed that -- report it rather than write a rule list
+    // that is missing one of its rules.
+    let file_rules: Vec<(&str, bool)> = role
+        .file_paths
+        .iter()
+        .map(|p| (p.pattern.as_str(), p.allow))
+        .collect();
+    match crate::codec::path_state_entries_for_role(role_id, &file_rules) {
+        Ok(entries) if entries.is_empty() => {}
+        Ok(entries) => sink.write_path_states(role_id, &entries)?,
+        Err(conflicts) => skipped.extend(conflicts.into_iter().map(|c| format!("file_paths: {c}"))),
     }
 
     // Execution rules share the path encoding, so a rule reaches the kernel by
     // exactly the route a file rule does. `args_pattern` is refused before a
     // policy gets here -- argv is not readable at bprm time -- so a rule that
     // arrives has only a path to say.
-    for e in &role.execution_rules {
-        sink.add_exec_state(role_id, &e.binary_path, e.allow)?;
+    let exec_rules: Vec<(&str, bool)> = role
+        .execution_rules
+        .iter()
+        .map(|e| (e.binary_path.as_str(), e.allow))
+        .collect();
+    match crate::codec::path_state_entries_for_role(role_id, &exec_rules) {
+        Ok(entries) if entries.is_empty() => {}
+        Ok(entries) => sink.write_exec_states(role_id, &entries)?,
+        Err(conflicts) => skipped.extend(
+            conflicts
+                .into_iter()
+                .map(|c| format!("execution_rules: {c}")),
+        ),
     }
 
     for r in &role.network_rules {
@@ -180,8 +213,8 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         flags: Vec<(u32, u8)>,
-        paths: Vec<(u32, String, bool)>,
-        execs: Vec<(u32, String, bool)>,
+        paths: Vec<(u32, Vec<PathStateEntry>)>,
+        execs: Vec<(u32, Vec<PathStateEntry>)>,
         net: Vec<(u32, u16, u8, u8, bool)>,
         ip: Vec<(u32, String, u8, bool)>,
         domain: Vec<(u32, String, bool)>,
@@ -209,12 +242,20 @@ mod tests {
             self.flags.push((r, f));
             Ok(())
         }
-        fn add_path_state(&mut self, r: u32, p: &str, a: bool) -> Result<(), Self::Err> {
-            self.paths.push((r, p.into(), a));
+        fn write_path_states(
+            &mut self,
+            r: u32,
+            entries: &[PathStateEntry],
+        ) -> Result<(), Self::Err> {
+            self.paths.push((r, entries.to_vec()));
             Ok(())
         }
-        fn add_exec_state(&mut self, r: u32, p: &str, a: bool) -> Result<(), Self::Err> {
-            self.execs.push((r, p.into(), a));
+        fn write_exec_states(
+            &mut self,
+            r: u32,
+            entries: &[PathStateEntry],
+        ) -> Result<(), Self::Err> {
+            self.execs.push((r, entries.to_vec()));
             Ok(())
         }
         fn add_network_rule(
@@ -307,11 +348,16 @@ mod tests {
 
         assert_eq!(rec.flags.len(), 1, "flags not applied");
         assert_eq!(rec.paths.len(), 1, "file_paths not applied");
+        assert!(!rec.paths[0].1.is_empty(), "file_paths encoded to nothing");
         assert!(!rec.net.is_empty(), "network_rules not applied");
         assert_eq!(rec.ip.len(), 1, "ip_rules not applied");
         assert_eq!(rec.domain.len(), 1, "domain_rules not applied");
         assert_eq!(rec.proxy.len(), 1, "proxy not applied");
         assert_eq!(rec.execs.len(), 1, "execution_rules not applied");
+        assert!(
+            !rec.execs[0].1.is_empty(),
+            "execution_rules encoded to nothing"
+        );
     }
 
     /// Execution rules and file rules are walked from state 0 for the same
@@ -322,8 +368,16 @@ mod tests {
         let mut rec = Recorder::default();
         apply_role(&mut rec, &full_role(), &resolving()).unwrap();
 
-        assert_eq!(rec.execs, vec![(7, "/usr/bin/curl".to_string(), false)]);
-        assert_eq!(rec.paths, vec![(7, "/etc/shadow".to_string(), false)]);
+        assert_eq!(
+            rec.execs[0].1,
+            crate::codec::path_state_entries_for_role(7, &[("/usr/bin/curl", false)]).unwrap(),
+            "exec map got the execution rule"
+        );
+        assert_eq!(
+            rec.paths[0].1,
+            crate::codec::path_state_entries_for_role(7, &[("/etc/shadow", false)]).unwrap(),
+            "file map got the file rule"
+        );
     }
 
     /// The common case, and the one that must not change behaviour: a role
@@ -336,8 +390,8 @@ mod tests {
         let mut rec = Recorder::default();
         apply_role(&mut rec, &role, &resolving()).unwrap();
 
-        assert!(rec.execs.is_empty());
-        assert_eq!(rec.paths.len(), 1, "file rules still applied");
+        assert!(rec.execs.is_empty(), "no execution rules, no write");
+        assert!(!rec.paths[0].1.is_empty(), "file rules still applied");
     }
 
     #[test]

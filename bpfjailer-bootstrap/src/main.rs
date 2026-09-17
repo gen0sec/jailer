@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use bpfjailer_common::apply::{apply_role, PolicySink, SystemResolver};
 use bpfjailer_common::codec;
+use bpfjailer_common::codec::PathStateEntry;
 use bpfjailer_common::policy::PolicyConfig;
 use libbpf_rs::MapCore;
 use libbpf_rs::{Link, MapFlags, Object, ObjectBuilder};
@@ -196,18 +197,18 @@ impl PolicySink for ObjectSink<'_> {
         Ok(())
     }
 
-    fn add_path_state(&mut self, role_id: u32, pattern: &str, allow: bool) -> Result<()> {
+    fn write_path_states(&mut self, _role_id: u32, entries: &[PathStateEntry]) -> Result<()> {
         let map = self.map("path_states")?;
-        for (key, value) in codec::path_state_entries(role_id, pattern, allow) {
-            map.update(&key, &value, MapFlags::empty())?;
+        for (key, value) in entries {
+            map.update(key, value, MapFlags::empty())?;
         }
         Ok(())
     }
 
-    fn add_exec_state(&mut self, role_id: u32, pattern: &str, allow: bool) -> Result<()> {
+    fn write_exec_states(&mut self, _role_id: u32, entries: &[PathStateEntry]) -> Result<()> {
         let map = self.map("exec_states")?;
-        for (key, value) in codec::path_state_entries(role_id, pattern, allow) {
-            map.update(&key, &value, MapFlags::empty())?;
+        for (key, value) in entries {
+            map.update(key, value, MapFlags::empty())?;
         }
         Ok(())
     }
@@ -564,7 +565,10 @@ mod root_integration {
             return;
         };
         let mut sink = ObjectSink { object: &object };
-        sink.add_path_state(31, "/srv/data/", false).expect("add");
+        let entries =
+            bpfjailer_common::codec::path_state_entries_for_role(31, &[("/srv/data/", false)])
+                .expect("no conflicts");
+        sink.write_path_states(31, &entries).expect("write");
         let map = map_by_name(&object, "path_states").expect("map");
         for (key, value) in bpfjailer_common::codec::path_state_entries(31, "/srv/data/", false) {
             let got = map

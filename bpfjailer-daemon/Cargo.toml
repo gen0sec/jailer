@@ -2,6 +2,7 @@
 name = "bpfjailer-daemon"
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "bpfjailer-daemon"

@@ -17,6 +17,11 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# These are applications loaded from disk, not libraries anyone depends on, and
+# they carry path dependencies that crates.io would reject anyway. Said here as
+# well as in release.toml so an accidental `cargo publish` is refused by Cargo
+# itself rather than by configuration the command does not read.
+publish = false
 
 [workspace.dependencies]
 libbpf-rs = "0.26"

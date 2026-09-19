@@ -19,6 +19,15 @@ const LOCAL_POLICY_PATH: &str = "config/policy.json";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before the logger, so the version lands on stdout by itself and a script
+    // can read it without filtering log lines out.
+    if let Some(line) =
+        bpfjailer_common::version::version_line(env::args().skip(1), env!("CARGO_PKG_NAME"))
+    {
+        println!("{line}");
+        return Ok(());
+    }
+
     env_logger::init();
 
     info!("BpfJailer daemon starting...");

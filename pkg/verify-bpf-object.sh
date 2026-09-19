@@ -43,12 +43,28 @@ die() { echo "error: $*" >&2; exit 1; }
 #
 # The binary itself is userspace talking to the bpf syscall; it is not coupled
 # to the running kernel. Any installed build will do.
+#
+# Where that build actually is takes two directories, because the package
+# installs the file in one and links to it from the other:
+#
+#   /usr/lib/linux-tools-6.8.0-139/bpftool          <- the binary
+#   /usr/lib/linux-tools/6.8.0-139-generic/bpftool  <- a symlink to it
+#
+# Those are siblings, not parent and child, so a search rooted at
+# /usr/lib/linux-tools only ever sees the symlink -- and a `-type f` test then
+# rejects that too, which is how this managed to find nothing at all on a host
+# where bpftool was installed.
 BPFTOOL=${BPFTOOL:-}
 if [ -z "$BPFTOOL" ]; then
   if command -v bpftool >/dev/null 2>&1 && bpftool version >/dev/null 2>&1; then
     BPFTOOL=bpftool
   else
-    BPFTOOL=$(find /usr/lib/linux-tools -name bpftool -type f 2>/dev/null | head -1)
+    for candidate in /usr/lib/linux-tools-*/bpftool /usr/lib/linux-tools/*/bpftool; do
+      if [ -x "$candidate" ] && "$candidate" version >/dev/null 2>&1; then
+        BPFTOOL=$candidate
+        break
+      fi
+    done
   fi
 fi
 if [ -z "$BPFTOOL" ] || ! "$BPFTOOL" version >/dev/null 2>&1; then

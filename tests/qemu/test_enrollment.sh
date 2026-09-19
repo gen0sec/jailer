@@ -41,7 +41,7 @@ cat > "${VM_DIR}/share/enrollment_policy.json" << 'POLICY'
         "allow_network": false,
         "allow_exec": false,
         "require_signed_binary": false,
-        "allow_setuid": false,
+        "allow_setuid": true,
         "allow_ptrace": false
       },
       "file_paths": [],
@@ -57,7 +57,7 @@ cat > "${VM_DIR}/share/enrollment_policy.json" << 'POLICY'
         "allow_network": true,
         "allow_exec": false,
         "require_signed_binary": false,
-        "allow_setuid": false,
+        "allow_setuid": true,
         "allow_ptrace": false
       },
       "file_paths": [

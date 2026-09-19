@@ -718,3 +718,65 @@ mod tests {
         }
     }
 }
+
+/// The policy files this repository ships must survive the check both loaders
+/// apply to any policy.
+///
+/// `config/policy.json` is copied to `/etc/bpfjailer/policy.json` by every
+/// install path there is, and the bootstrap refuses a policy asking for
+/// anything unenforced -- so an example that trips that check is an example
+/// that makes the bootstrap exit 1 on a fresh install. It did: every role set
+/// `allow_setuid: false`, which cannot be enforced and is therefore refused.
+///
+/// Nothing tied the shipped examples to the check. This does.
+#[cfg(test)]
+mod shipped_policies_load {
+    use super::*;
+
+    const MAIN: &str = include_str!("../../config/policy.json");
+    const DOCKER_EXAMPLE: &str = include_str!("../../examples/docker/policy.json");
+
+    fn assert_accepted(label: &str, json: &str) {
+        let config: PolicyConfig =
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("{label} is not valid: {e}"));
+        assert!(!config.roles.is_empty(), "{label} defines no roles");
+
+        for (name, role) in &config.roles {
+            let unenforced = unenforced_settings(role);
+            assert!(
+                unenforced.is_empty(),
+                "{label} role '{name}' requests {unenforced:?}, which this build \
+                 does not enforce -- the bootstrap refuses such a policy and \
+                 exits non-zero, and the daemon falls back to built-in roles"
+            );
+        }
+    }
+
+    #[test]
+    fn the_policy_installed_to_etc_is_accepted() {
+        assert_accepted("config/policy.json", MAIN);
+    }
+
+    #[test]
+    fn the_docker_example_policy_is_accepted() {
+        assert_accepted("examples/docker/policy.json", DOCKER_EXAMPLE);
+    }
+
+    /// Discrimination control: the assertion above has to be able to fail, or
+    /// a policy that loads and one that is refused would look the same here.
+    #[test]
+    fn a_policy_asking_for_something_unenforced_is_still_caught() {
+        let refused = MAIN.replace("\"allow_setuid\": true", "\"allow_setuid\": false");
+        assert_ne!(refused, MAIN, "the substitution matched nothing");
+
+        let config: PolicyConfig = serde_json::from_str(&refused).expect("still valid json");
+        assert!(
+            config
+                .roles
+                .values()
+                .any(|r| !unenforced_settings(r).is_empty()),
+            "denying setuid is no longer reported as unenforced, so this check \
+             has stopped discriminating"
+        );
+    }
+}

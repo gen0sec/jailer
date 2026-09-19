@@ -91,7 +91,7 @@ write_files:
               "allow_network": false,
               "allow_exec": false,
               "require_signed_binary": false,
-              "allow_setuid": false,
+              "allow_setuid": true,
               "allow_ptrace": false
             },
             "file_paths": [],
@@ -107,7 +107,7 @@ write_files:
               "allow_network": true,
               "allow_exec": true,
               "require_signed_binary": false,
-              "allow_setuid": false,
+              "allow_setuid": true,
               "allow_ptrace": false
             },
             "file_paths": [],

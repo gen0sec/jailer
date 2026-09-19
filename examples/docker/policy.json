@@ -1,4 +1,5 @@
 {
+  "_comment_allow_setuid": "allow_setuid must be true in every role. It is not a grant of privilege: the jailer does not gate setuid at all, because the bprm_check_security hook runs before the kernel evaluates setuid-ness (see bpfjailer-common/src/flags.rs). Asking to deny it would be asking for a restriction that is not applied, so the loaders refuse such a policy rather than apply it and look protected. Tracked in issue #43.",
   "roles": {
     "ai_agent": {
       "id": 12,
@@ -8,7 +9,7 @@
         "allow_network": true,
         "allow_exec": false,
         "require_signed_binary": false,
-        "allow_setuid": false,
+        "allow_setuid": true,
         "allow_ptrace": false,
         "allow_module_load": false,
         "allow_bpf_load": false,
@@ -64,7 +65,7 @@
         "allow_network": true,
         "allow_exec": false,
         "require_signed_binary": false,
-        "allow_setuid": false,
+        "allow_setuid": true,
         "allow_ptrace": false,
         "allow_module_load": false,
         "allow_bpf_load": false,
@@ -101,7 +102,7 @@
         "allow_network": false,
         "allow_exec": false,
         "require_signed_binary": false,
-        "allow_setuid": false,
+        "allow_setuid": true,
         "allow_ptrace": false
       },
       "file_paths": [],

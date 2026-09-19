@@ -1,0 +1,12 @@
+# Build output. Without this the context is gigabytes and, worse, a stale
+# host-built target/ would shadow what the container compiles.
+target/
+bpfjailer-bpf/target/
+test_task_storage/target/
+examples/target/
+
+.git/
+*.qcow2
+*.img
+*.log
+BpfJailer LPC 2025.pdf

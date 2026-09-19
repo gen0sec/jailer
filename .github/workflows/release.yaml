@@ -1,0 +1,232 @@
+name: Release
+
+# Cutting a release is `make release VERSION=x.y.z` from main: cargo-release
+# bumps [workspace.package].version, propagates it to install.sh and the README,
+# commits, tags vX.Y.Z and pushes. The tag is what starts this.
+#
+# The GitHub release is opened as a *draft*. Publishing it stays a deliberate
+# manual act.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # For re-running a release build against a tag that already exists. Select the
+  # tag as the ref; the first step refuses anything else.
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Actions are pinned by commit SHA, not tag: this workflow handles the signing
+# key, and a moved tag would be a silent change to what touches it.
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    timeout-minutes: 60
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve version from the tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/tags/v*) ;;
+            *) echo "::error::this workflow must run on a v* tag, got ${GITHUB_REF}"; exit 1 ;;
+          esac
+          echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # Built in an Ubuntu 20.04 container so glibc 2.31 is the floor. Building
+      # on the runner directly would stamp its own 2.39 into every artifact and
+      # they would refuse to start on anything older.
+      - name: Build release artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker build \
+            --target output \
+            --output type=local,dest=./out \
+            -f pkg/docker/build.Dockerfile .
+
+      # The tag and the binary must agree. cargo-release keeps them in step, but
+      # a tag pushed by hand would not, and the artifact would carry a version
+      # nobody could match to a release.
+      - name: Check the binaries report the tagged version
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          chmod +x out/bpfjailer-bootstrap out/bpfjailer-daemon
+          for b in bpfjailer-bootstrap bpfjailer-daemon; do
+            got=$("./out/$b" --version)
+            want="$b $VERSION"
+            [ "$got" = "$want" ] || {
+              echo "::error::$b reports '$got' but the tag says '$want'"
+              exit 1
+            }
+          done
+
+      - name: Assemble tarball
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euxo pipefail
+          DIR="bpfjailer-${VERSION}-${ARCH}-linux-gnu"
+          mkdir -p "$DIR"
+          install -m0755 out/bpfjailer-bootstrap out/bpfjailer-daemon "$DIR/"
+          install -m0644 out/bpfjailer.bpf.o "$DIR/"
+          install -m0644 config/policy.json "$DIR/policy.json"
+          install -m0644 config/bpfjailer-bootstrap.service \
+                         config/bpfjailer-daemon.service "$DIR/"
+          install -m0644 README.md LICENSE "$DIR/"
+          install -m0755 check_kernel_support.sh "$DIR/"
+          tar czf "${DIR}.tar.gz" "$DIR"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bpfjailer-${{ matrix.arch }}
+          path: bpfjailer-*.tar.gz
+          if-no-files-found: error
+
+  # The object that ships must be one the verifier accepts.
+  #
+  # Nothing else covers this. The wellness-check job builds its own object with
+  # the *runner's* clang, not the release container's clang-18 on focal, so it
+  # exercises a different compiler than the one whose output is published. A
+  # program the verifier refuses would surface first on an operator's host.
+  #
+  # Loading is enough and attaching is not needed -- the same thing the root
+  # integration tests do. Attaching would additionally require `bpf` in the
+  # active LSM list, which these runners do not have.
+  verify-bpf-object:
+    name: Verify BPF object loads (${{ matrix.arch }})
+    needs: build
+    timeout-minutes: 15
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      # For pkg/verify-bpf-object.sh and the LSM_PROGRAMS list it reads.
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bpfjailer-${{ matrix.arch }}
+
+      - name: Load the shipped object into the running kernel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-generic
+          tar xzf bpfjailer-*.tar.gz
+          OBJ=$(find . -name bpfjailer.bpf.o | head -1)
+          test -n "$OBJ"
+          sudo pkg/verify-bpf-object.sh "$OBJ"
+
+  release:
+    name: Sign and draft the release
+    needs: [build, verify-bpf-object]
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # Checked before anything else, so a missing key costs no build time and
+      # so an unsigned release can never ship by accident.
+      - name: Require the signing key
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${GPG_PRIVATE_KEY}" ] || missing="${missing} GPG_PRIVATE_KEY"
+          [ -n "${GPG_PASSPHRASE}" ] || missing="${missing} GPG_PASSPHRASE"
+          if [ -n "${missing}" ]; then
+            echo "::error::missing repository secret(s):${missing}. Add them under"
+            echo "::error::Settings > Secrets and variables > Actions before releasing."
+            exit 1
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bpfjailer-*
+          merge-multiple: true
+
+      - name: Import GPG signing key
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          echo "${GPG_PRIVATE_KEY}" | gpg --batch --import
+          GPG_KEY_ID=$(gpg --list-secret-keys --with-colons | grep '^sec' | head -1 | cut -d: -f5)
+          echo "GPG_KEY_ID=${GPG_KEY_ID}" >> "$GITHUB_ENV"
+
+      - name: Sign artifacts
+        shell: bash
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          for f in bpfjailer-*.tar.gz; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "${GPG_PASSPHRASE}" \
+              --detach-sign --armor --default-key "${GPG_KEY_ID}" "$f"
+          done
+
+      - name: Export the public key
+        run: gpg --armor --export "${GPG_KEY_ID}" > bpfjailer-signing-key.asc
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in bpfjailer-*.tar.gz; do
+            sha256sum "$f" > "${f}.sha256"
+            cat "${f}.sha256"
+          done
+
+      - name: Draft the release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            bpfjailer-*.tar.gz
+            bpfjailer-*.tar.gz.asc
+            bpfjailer-*.tar.gz.sha256
+            bpfjailer-signing-key.asc

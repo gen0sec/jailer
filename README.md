@@ -93,6 +93,40 @@ chmod +x /tmp/enable_bpf_lsm.sh
 sudo /tmp/enable_bpf_lsm.sh
 ```
 
+## Install
+
+### From a release
+
+Prebuilt tarballs are published for `x86_64` and `aarch64`, built against
+glibc 2.31 so they run on older distributions than the one they were built on.
+
+```bash
+curl -fsSL https://github.com/gen0sec/jailer/raw/main/install.sh | sudo sh
+```
+
+The script verifies the SHA256 before installing anything. Every artifact is
+also GPG-signed; to check provenance, import the release key first:
+
+```bash
+curl -fsSL https://github.com/gen0sec/jailer/releases/download/v0.1.0/bpfjailer-signing-key.asc | gpg --import
+```
+
+To install by hand instead, download the tarball for your architecture from the
+[releases page](https://github.com/gen0sec/jailer/releases) and:
+
+```bash
+tar xzf bpfjailer-*-linux-gnu.tar.gz && cd bpfjailer-*-linux-gnu
+sudo install -Dm0755 bpfjailer-bootstrap /usr/sbin/bpfjailer-bootstrap
+sudo install -Dm0755 bpfjailer-daemon    /usr/sbin/bpfjailer-daemon
+sudo install -Dm0644 bpfjailer.bpf.o     /usr/lib/bpfjailer/bpfjailer.bpf.o
+sudo install -Dm0644 policy.json         /etc/bpfjailer/policy.json
+sudo install -Dm0644 bpfjailer-*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+Then enable one of the two modes described under
+[Installation Modes](#installation-modes).
+
 ## Build
 
 ### Prerequisites
@@ -111,7 +145,7 @@ rustup target add bpfel-unknown-none
 ### Build All Components
 
 ```bash
-cd bpfjail
+cd jailer
 
 # Build BPF programs
 cd bpfjailer-bpf && cargo build --release && cd ..
@@ -403,6 +437,12 @@ sudo cp target/release/bpfjailer-daemon /usr/sbin/
 sudo mkdir -p /etc/bpfjailer
 sudo cp config/policy.json /etc/bpfjailer/
 
+# The compiled object is loaded at runtime, not linked in. Under the
+# shipped unit the working directory is / and the filesystem is read-only,
+# so an installed location is the only one that resolves.
+sudo install -Dm0644 bpfjailer-bpf/target/bpfel-unknown-none/release/bpfjailer.bpf.o \
+                     /usr/lib/bpfjailer/bpfjailer.bpf.o
+
 # Enable and start
 sudo systemctl daemon-reload
 sudo systemctl enable bpfjailer-daemon
@@ -424,6 +464,12 @@ sudo cp config/bpfjailer-bootstrap.service /etc/systemd/system/
 sudo cp target/release/bpfjailer-bootstrap /usr/sbin/
 sudo mkdir -p /etc/bpfjailer
 sudo cp config/policy.json /etc/bpfjailer/
+
+# The compiled object is loaded at runtime, not linked in. Under the
+# shipped unit the working directory is / and the filesystem is read-only,
+# so an installed location is the only one that resolves.
+sudo install -Dm0644 bpfjailer-bpf/target/bpfel-unknown-none/release/bpfjailer.bpf.o \
+                     /usr/lib/bpfjailer/bpfjailer.bpf.o
 
 # Enable (will run at next boot)
 sudo systemctl daemon-reload

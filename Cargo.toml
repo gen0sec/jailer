@@ -11,6 +11,13 @@ exclude = [
 ]
 resolver = "2"
 
+# The single source of truth for the release version. Every member inherits it
+# via `version.workspace = true`, so `cargo release` bumps one field and the
+# `--version` both binaries print can never disagree with the tag.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
 [workspace.dependencies]
 libbpf-rs = "0.26"
 libbpf-sys = "1.4"

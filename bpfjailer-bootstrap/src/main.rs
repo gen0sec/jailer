@@ -42,6 +42,15 @@ fn prog_by_name<'a>(object: &'a Object, name: &str) -> Option<libbpf_rs::Program
 }
 
 fn main() {
+    // Before the logger, so the version lands on stdout by itself and a script
+    // can read it without filtering log lines out.
+    if let Some(line) =
+        bpfjailer_common::version::version_line(std::env::args().skip(1), env!("CARGO_PKG_NAME"))
+    {
+        println!("{line}");
+        return;
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     if let Err(e) = run() {

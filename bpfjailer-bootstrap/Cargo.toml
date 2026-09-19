@@ -2,6 +2,7 @@
 name = "bpfjailer-bootstrap"
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 description = "BpfJailer bootstrap loader for daemonless installation"
 
 [[bin]]

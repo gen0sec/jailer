@@ -17,7 +17,13 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadOnlyPaths=/
-ReadWritePaths=/sys/fs/bpf /run/bpfjailer
+ReadWritePaths=/sys/fs/bpf
+
+# The enrollment socket lives in /run/bpfjailer. This was named in
+# ReadWritePaths= above, which grants access to an existing directory but does
+# not create one -- and /run is a tmpfs, so on a fresh boot there was nothing
+# there to grant. RuntimeDirectory= creates it.
+RuntimeDirectory=bpfjailer
 
 [Install]
 WantedBy=multi-user.target

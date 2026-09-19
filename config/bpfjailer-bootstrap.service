@@ -21,5 +21,17 @@ PrivateTmp=yes
 ReadOnlyPaths=/
 ReadWritePaths=/sys/fs/bpf
 
+# The build id recorded beside the pins lives in /run/bpfjailer, and pin_all
+# fails if it cannot be written -- so without this the bootstrap pins every
+# program and map and then exits non-zero. RuntimeDirectory= both creates the
+# directory and makes it writable; ReadWritePaths= would do neither, and /run is
+# a tmpfs emptied on every boot, so there is nothing to grant access to.
+#
+# Preserved across a stop because the pins are: they last until reboot whatever
+# happens to this oneshot, and a build id that disappeared while they remained
+# would make the next run read its own pins as another build's.
+RuntimeDirectory=bpfjailer
+RuntimeDirectoryPreserve=yes
+
 [Install]
 WantedBy=sysinit.target

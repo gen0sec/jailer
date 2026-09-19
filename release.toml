@@ -1,0 +1,34 @@
+# cargo-release configuration (https://github.com/crate-ci/cargo-release)
+#
+# The single source of truth for the release version is [workspace.package]
+# version in the root Cargo.toml; every crate inherits it via
+# `version.workspace = true`, so a bump touches one field and the
+# `bpfjailer-bootstrap --version` a host reports always matches the tag.
+#
+# `make release` wraps `cargo release`, which:
+#   - bumps the version in Cargo.toml and refreshes Cargo.lock,
+#   - propagates it to the non-Cargo files below,
+#   - commits, creates the vX.Y.Z tag, and pushes both.
+# Pushing the tag triggers .github/workflows/release.yaml, which builds the
+# artifacts, verifies the BPF object loads, signs everything and opens a *draft*
+# GitHub release. Publishing that draft stays a deliberate manual act.
+
+allow-branch = ["main"]
+publish = false                    # these are applications, not crates.io crates
+push = true
+tag = true
+shared-version = true              # one tag for the workspace, not five
+sign-commit = false
+sign-tag = false
+tag-name = "v{{version}}"
+tag-message = "Release bpfjailer {{version}}"
+pre-release-commit-message = "chore: release bpfjailer {{version}}"
+# One commit and one tag for the whole workspace, not one per member.
+consolidate-commits = true
+
+# The files carrying a version that Cargo does not own live in
+# bpfjailer-bootstrap/release.toml, not here. This is a virtual workspace, so
+# cargo-release resolves a replacement path against *each member's* manifest
+# directory -- a `file = "README.md"` here is five different READMEs, four of
+# which do not exist, and the release aborts. Declaring them against one member
+# resolves them once, relative to that member.

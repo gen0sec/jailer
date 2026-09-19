@@ -1,0 +1,25 @@
+# Version stamping for the files Cargo does not own.
+#
+# These live here rather than in the workspace `release.toml` because this is a
+# virtual workspace: cargo-release resolves a replacement path against each
+# member's manifest directory, so a `file = "install.sh"` at the root means five
+# paths, four of which do not exist, and the release aborts before tagging.
+# Declared against one member, each path resolves once.
+#
+# This member, because it is the one whose `--version` an operator reads back
+# off a host after running install.sh.
+
+[[pre-release-replacements]]
+file = "../install.sh"
+search = '(?m)^VERSION=.*$'
+replace = "VERSION={{version}}"
+exactly = 1
+prerelease = false
+
+# The README's release key URL, in the install section.
+[[pre-release-replacements]]
+file = "../README.md"
+search = 'releases/download/v[0-9]+\.[0-9]+\.[0-9]+/'
+replace = "releases/download/v{{version}}/"
+exactly = 1
+prerelease = false

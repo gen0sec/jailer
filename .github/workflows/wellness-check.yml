@@ -137,3 +137,13 @@ jobs:
           sudo -E env "PATH=$PATH" cargo test --workspace --release \
             -- --include-ignored --test-threads=1
 
+      # The same gate the release workflow runs, here on the object this job
+      # just built. Running it on every pull request is what keeps it working:
+      # otherwise the first time anyone found out it was broken would be the
+      # day they tried to cut a release.
+      - name: Verify the BPF object loads and carries every LSM program
+        run: |
+          sudo apt-get install -y linux-tools-generic
+          sudo pkg/verify-bpf-object.sh \
+            bpfjailer-bpf/target/bpfel-unknown-none/release/bpfjailer.bpf.o
+

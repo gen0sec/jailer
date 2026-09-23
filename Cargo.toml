@@ -15,7 +15,7 @@ resolver = "2"
 # via `version.workspace = true`, so `cargo release` bumps one field and the
 # `--version` both binaries print can never disagree with the tag.
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # These are applications loaded from disk, not libraries anyone depends on, and
 # they carry path dependencies that crates.io would reject anyway. Said here as

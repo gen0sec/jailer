@@ -126,7 +126,7 @@ checksum = "812e12b5285cc515a9c72a5c1d3b6d46a19dac5acfef5265968c166106e31dd3"
 
 [[package]]
 name = "bpfjailer-bootstrap"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bpfjailer-common",
@@ -138,11 +138,11 @@ dependencies = [
 
 [[package]]
 name = "bpfjailer-bpf"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bpfjailer-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bpfjailer-common",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "bpfjailer-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "bpfjailer-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bpfjailer-client",

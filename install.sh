@@ -6,7 +6,7 @@
 # edit it by hand, or the script will fetch a release that does not match the
 # tree it was committed from.
 
-VERSION=0.1.0
+VERSION=0.1.1
 REPO=gen0sec/jailer
 BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
 

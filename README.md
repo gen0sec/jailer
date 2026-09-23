@@ -108,7 +108,7 @@ The script verifies the SHA256 before installing anything. Every artifact is
 also GPG-signed; to check provenance, import the release key first:
 
 ```bash
-curl -fsSL https://github.com/gen0sec/jailer/releases/download/v0.1.0/bpfjailer-signing-key.asc | gpg --import
+curl -fsSL https://github.com/gen0sec/jailer/releases/download/v0.1.1/bpfjailer-signing-key.asc | gpg --import
 ```
 
 To install by hand instead, download the tarball for your architecture from the

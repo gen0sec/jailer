@@ -580,8 +580,26 @@ static __always_inline int check_path_state_machine(void *states, u32 role_id,
         if (idx >= MAX_COMPONENTS)
             break;
 
+        // The mask is what keeps the index in range, and barrier_var() is what
+        // keeps the mask. Without it clang strength-reduces this unrolled loop
+        // into "base + (idx << 3)" with the load at -8 -- element idx-1 -- and
+        // the verifier then sees a minimum offset of -8 into a map value:
+        //
+        //   350: (79) r1 = *(u64 *)(r2 -8)
+        //   invalid access to map value, value_size=136 off=-8 size=8
+        //   R2 min value is outside of the allowed memory range
+        //   libbpf: prog 'file_open': failed to load: -EACCES
+        //
+        // Linux 6.18's verifier proves that safe and loads the program; 6.6's
+        // does not, so the whole object fails to load and bpfjailer-bootstrap
+        // dies on any kernel with the older range tracking. The barrier is the
+        // standard libbpf remedy: it hides the value's provenance from the
+        // optimiser, so the masked index survives into the generated code.
+        idx &= (MAX_COMPONENTS - 1);
+        barrier_var(idx);
+
         key.state = state;
-        key.component_hash = buf->hashes[idx & (MAX_COMPONENTS - 1)];
+        key.component_hash = buf->hashes[idx];
 
         struct path_state_value *val = bpf_map_lookup_elem(states, &key);
 

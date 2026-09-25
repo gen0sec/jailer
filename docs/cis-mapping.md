@@ -58,6 +58,27 @@ Available to Rust callers building a role at runtime as
 `SecretPatterns::cis_hardening()`; a test asserts the preset and the shipped
 JSON never diverge.
 
+## Is any of this actually enforced?
+
+The unit tests prove the rules *encode* to the decisions claimed — they walk a
+Rust model of `check_path_state_machine`. A model can agree with a BPF program
+that is wrong in the same direction, and the CI root job loads the object
+without attaching it, because attaching needs `bpf` in the LSM list.
+
+`tests/cis-enforcement.sh` closes that gap against a real kernel. Every
+assertion carries a control, because a role that denied everything and a file
+that was unreadable anyway both look like enforcement:
+
+```
+./tests/cis-enforcement.sh --target ssh://root@HOST:PORT --key PATH
+```
+
+Last run, on Ubuntu 24.04 with kernel 6.8.0-138 and `lsm=...,bpf`: 19 passed,
+0 failed. An enrolled process was refused `/etc/shadow`, `/etc/gshadow`,
+`/root/`, `/etc/ssh/` and `/etc/sudoers`; an unenrolled process running as the
+same uid read them all; and the enrolled process still read `/etc/hostname` and
+`/etc/passwd`.
+
 ## Control by control
 
 ### Closest to enforcing a control
@@ -67,6 +88,13 @@ JSON never diverge.
 protocols reach a system by kernel autoload when something calls `socket()` for
 them, and that is exactly the path being denied — so for an enrolled process the
 effect is the one the control wants.
+
+Verified on a kernel, not inferred: an enrolled process calling
+`socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)` with the module unloaded gets
+`EPROTONOSUPPORT` and the module stays out; the same call from an unenrolled
+process succeeds and loads it. The denial surfaces as "Protocol not supported"
+rather than "Permission denied", which is indistinguishable from a kernel that
+simply lacks the module — arguably the better failure.
 
 Two honest limits. It covers **autoload only**: an explicit `insmod` or
 `finit_module` by root is a different path and is not denied here. And it applies
@@ -154,6 +182,10 @@ assuming that buys anything, because the depth limit is on the path being
 opened, not on the pattern.
 
 ## Limits you should read before relying on this
+
+Both limits below were **confirmed on a running kernel**, not derived from the
+model — `tests/cis-enforcement.sh` asserts them, so if either ever stops being
+true the test fails rather than the documentation quietly going stale.
 
 These roles raise the cost of an attack. They do not contain a hostile root
 process, and three specific gaps are worth knowing by name.

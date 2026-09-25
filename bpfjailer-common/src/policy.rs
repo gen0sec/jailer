@@ -271,6 +271,48 @@ impl SecretPatterns {
             allow: false,
         }]
     }
+
+    /// The deny set the shipped `cis_*` roles carry.
+    ///
+    /// Aligned to the CIS Distribution Independent Linux Benchmark: the
+    /// credential files of 6.1.3/6.1.5/6.1.7/6.1.9, the boot configuration of
+    /// 1.4, the audit configuration of 4.1, and the sudoers of 4.1.16. See
+    /// `docs/cis-mapping.md` for what that alignment does and does not claim.
+    ///
+    /// Two properties are deliberate and are what make this set safe to apply
+    /// to an arbitrary process:
+    ///
+    /// * Every pattern is literal and at most three components deep. A rule
+    ///   deeper than `MAX_COMPONENTS` never matches, and for a role with
+    ///   `allow_file_access` that reads as *allowed* -- a deny that silently
+    ///   inverts is worse than no rule.
+    /// * Nothing here is a path a process opens in normal operation. The
+    ///   `file_open` hook carries no read/write distinction, so a deny denies
+    ///   the open outright: `/etc/passwd` and `/etc/group` are therefore
+    ///   absent, despite CIS 6.1.2/6.1.4, because denying them would break
+    ///   username resolution in every confined service.
+    ///
+    /// Returned as data so a caller building a role over `DefineRole` gets the
+    /// same protection as the shipped JSON. They are asserted equal in tests.
+    pub fn cis_hardening() -> Vec<PathPattern> {
+        [
+            "/etc/shadow",
+            "/etc/gshadow",
+            "/etc/shadow-",
+            "/etc/gshadow-",
+            "/root/",
+            "/boot/",
+            "/etc/audit/",
+            "/etc/sudoers",
+            "/etc/sudoers.d/",
+        ]
+        .iter()
+        .map(|p| PathPattern {
+            pattern: (*p).to_string(),
+            allow: false,
+        })
+        .collect()
+    }
 }
 
 /// Common allowed domains for AI agents
@@ -760,6 +802,90 @@ mod shipped_policies_load {
     #[test]
     fn the_docker_example_policy_is_accepted() {
         assert_accepted("examples/docker/policy.json", DOCKER_EXAMPLE);
+    }
+
+    /// The Rust preset and the shipped JSON must carry the same deny set.
+    ///
+    /// Two ways to get a CIS role exist -- the shipped policy file, and
+    /// `SecretPatterns::cis_hardening()` for a caller defining a role at
+    /// runtime -- and nothing else would notice them diverging. A caller that
+    /// built its role from the preset would then believe it had the protection
+    /// the shipped role documents, and quietly have less.
+    #[test]
+    fn the_preset_and_the_shipped_baseline_role_agree() {
+        let config: PolicyConfig = serde_json::from_str(MAIN).expect("valid");
+        let shipped: Vec<(String, bool)> = config.roles["cis_baseline"]
+            .file_paths
+            .iter()
+            .map(|p| (p.pattern.clone(), p.allow))
+            .collect();
+        let preset: Vec<(String, bool)> = crate::policy::SecretPatterns::cis_hardening()
+            .into_iter()
+            .map(|p| (p.pattern, p.allow))
+            .collect();
+        assert_eq!(shipped, preset);
+    }
+
+    /// The tiers are a ladder in what they permit, not three unrelated roles.
+    /// Each step must clear at least one flag and clear none that a looser tier
+    /// had already cleared.
+    #[test]
+    fn the_cis_tiers_get_strictly_stricter() {
+        let config: PolicyConfig = serde_json::from_str(MAIN).expect("valid");
+        let tiers = ["cis_baseline", "cis_service", "cis_isolated"];
+
+        let granted = |name: &str| -> Vec<&'static str> {
+            let f = config.roles[name].flags;
+            let mut out = Vec::new();
+            for (on, label) in [
+                (f.allow_file_access, "file"),
+                (f.allow_network, "network"),
+                (f.allow_exec, "exec"),
+                (f.allow_ptrace, "ptrace"),
+                (f.allow_module_load, "module_load"),
+                (f.allow_bpf_load, "bpf_load"),
+            ] {
+                if on {
+                    out.push(label);
+                }
+            }
+            out
+        };
+
+        for pair in tiers.windows(2) {
+            let (looser, tighter) = (granted(pair[0]), granted(pair[1]));
+            for g in &tighter {
+                assert!(
+                    looser.contains(g),
+                    "{} grants {g} but the looser {} does not, so the tiers are \
+                     not a ladder",
+                    pair[1],
+                    pair[0]
+                );
+            }
+            assert!(
+                tighter.len() < looser.len(),
+                "{} grants as much as {}, so it is not a tighter tier",
+                pair[1],
+                pair[0]
+            );
+        }
+    }
+
+    /// Every tier must deny ptrace, module load and BPF load. Those three are
+    /// the flags the BPF side tests outside the path walk, and they are the
+    /// whole of what a CIS role can enforce beyond file access.
+    #[test]
+    fn every_cis_tier_denies_the_privilege_flags() {
+        let config: PolicyConfig = serde_json::from_str(MAIN).expect("valid");
+        for name in ["cis_baseline", "cis_service", "cis_isolated"] {
+            let f = config.roles[name].flags;
+            assert!(!f.allow_ptrace, "{name} must deny ptrace");
+            assert!(!f.allow_module_load, "{name} must deny module load");
+            assert!(!f.allow_bpf_load, "{name} must deny BPF load");
+            assert!(f.allow_setuid, "{name} must set allow_setuid: true");
+            assert!(!f.require_signed_binary, "{name} must not require signing");
+        }
     }
 
     /// Discrimination control: the assertion above has to be able to fail, or

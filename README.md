@@ -331,8 +331,12 @@ modes.
 | Role ID | Name | File Access | Network | Exec |
 |---------|------|-------------|---------|------|
 | 14 | cis_baseline | Allowed, credential paths denied | Allowed | Allowed |
-| 15 | cis_service | As above, plus `/etc/ssh` denied | Allowed | Blocked |
-| 16 | cis_isolated | As `cis_service` | Blocked | Blocked |
+| 15 | cis_service | Same denies | Allowed | Blocked |
+| 16 | cis_isolated | Same denies | Blocked, AF_UNIX included | Blocked |
+
+All three carry the same deny set and differ only in flags. **None of them
+suits an authentication daemon** — they deny `/etc/shadow` and `/root/`, so an
+enrolled sshd cannot authenticate anyone.
 
 They enforce nothing until a process is enrolled in one; the shipped policy
 enrols nothing. **These roles do not make a host pass a CIS scan** — the

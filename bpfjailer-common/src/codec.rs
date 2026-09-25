@@ -1512,6 +1512,45 @@ mod path_walk_semantics {
         "/etc/sudoers.d/90-local",
     ];
 
+    /// The depth limit is on the path being OPENED, not on the pattern.
+    ///
+    /// A shallow rule buys nothing here: `collect_path_components` stops at
+    /// MAX_COMPONENTS without reaching the task's root, sets `truncated`, and
+    /// the walk then reports no rule -- which for these roles, all of which
+    /// grant `allow_file_access`, reads as ALLOWED. So a file buried deeply
+    /// enough under `/root/` is not denied, and no arrangement of patterns can
+    /// change that.
+    ///
+    /// Pinned rather than documented away, because the mapping page previously
+    /// claimed shallow patterns made the inversion impossible.
+    #[test]
+    fn a_path_too_deep_to_collect_escapes_the_cis_denies() {
+        let (id, rules) = cis_role("cis_baseline");
+        let borrowed: Vec<(&str, bool)> = rules.iter().map(|(p, a)| (p.as_str(), *a)).collect();
+        let mut map = HashMap::new();
+        for (k, v) in path_state_entries_for_role(id, &borrowed).expect("not refused") {
+            map.insert(k, v);
+        }
+
+        let shallow = ["root", "secret"];
+        assert_eq!(
+            walk_components(&map, id, &shallow, false),
+            Decision::Deny,
+            "the deny must bite at a normal depth"
+        );
+
+        let deep: Vec<String> = std::iter::once("root".to_string())
+            .chain((1..=MAX_COMPONENTS).map(|i| format!("d{i}")))
+            .collect();
+        let deep: Vec<&str> = deep.iter().map(String::as_str).collect();
+        assert!(deep.len() > MAX_COMPONENTS);
+        assert_eq!(
+            walk_components(&map, id, &deep, false),
+            Decision::NoRule,
+            "a path too deep to collect reports no rule, so allow_file_access allows it"
+        );
+    }
+
     #[test]
     fn every_cis_role_denies_the_credential_boot_and_audit_paths() {
         for role in CIS_ROLES {
@@ -1541,23 +1580,39 @@ mod path_walk_semantics {
         }
     }
 
-    /// `/etc/ssh` holds the host private keys (CIS 5.2.2). The confined tiers
-    /// deny it; `cis_baseline` deliberately does not, because it has to stay
-    /// safe to enrol anything into -- including sshd, which cannot start
-    /// without reading them.
+    /// `/etc/ssh` holds the host private keys (CIS 5.2.2) and every tier
+    /// denies it.
+    ///
+    /// It was briefly denied only by the two confined tiers, on the reasoning
+    /// that `cis_baseline` had to stay safe to enrol sshd into. That reasoning
+    /// was wrong in a way worth recording: baseline already denies
+    /// `/etc/shadow` and `/root/`, so an enrolled sshd loses password auth
+    /// (`unix_chkpwd`) and root key auth (`/root/.ssh/authorized_keys`)
+    /// regardless. The carve-out bought nothing and made the set non-uniform.
     #[test]
-    fn only_the_confined_tiers_deny_the_ssh_host_keys() {
-        assert_eq!(
-            cis_decision("cis_baseline", "/etc/ssh/ssh_host_ed25519_key"),
-            Decision::NoRule,
-            "cis_baseline must not deny the host keys: sshd could not start"
-        );
-        for role in ["cis_service", "cis_isolated"] {
+    fn every_tier_denies_the_ssh_host_keys() {
+        for role in CIS_ROLES {
             assert_eq!(
                 cis_decision(role, "/etc/ssh/ssh_host_ed25519_key"),
                 Decision::Deny,
                 "{role} must deny the SSH host keys"
             );
+        }
+    }
+
+    /// The paths that make these roles unsuitable for an authentication
+    /// daemon. Asserted so the documentation's warning cannot drift from what
+    /// the roles do.
+    #[test]
+    fn every_tier_denies_what_an_authentication_daemon_needs() {
+        for role in CIS_ROLES {
+            for path in ["/etc/shadow", "/root/.ssh/authorized_keys"] {
+                assert_eq!(
+                    cis_decision(role, path),
+                    Decision::Deny,
+                    "{role} denies {path}, so sshd cannot authenticate under it"
+                );
+            }
         }
     }
 

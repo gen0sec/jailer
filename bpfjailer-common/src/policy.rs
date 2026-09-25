@@ -272,25 +272,29 @@ impl SecretPatterns {
         }]
     }
 
-    /// The deny set the shipped `cis_*` roles carry.
+    /// The deny set every shipped `cis_*` role carries.
     ///
     /// Aligned to the CIS Distribution Independent Linux Benchmark: the
-    /// credential files of 6.1.3/6.1.5/6.1.7/6.1.9, the boot configuration of
-    /// 1.4, the audit configuration of 4.1, and the sudoers of 4.1.16. See
-    /// `docs/cis-mapping.md` for what that alignment does and does not claim.
+    /// credential files of 6.1.3/6.1.5/6.1.7/6.1.9, the SSH host keys of 5.2.2,
+    /// the boot configuration of 1.4, the audit configuration of 4.1, and the
+    /// sudoers of 4.1.16. See `docs/cis-mapping.md` for what that alignment
+    /// does and does not claim.
     ///
-    /// Two properties are deliberate and are what make this set safe to apply
-    /// to an arbitrary process:
+    /// Nothing here is a path a *confined service* opens in normal operation.
+    /// The `file_open` hook carries no read/write distinction, so a deny denies
+    /// the open outright -- which is why `/etc/passwd` and `/etc/group` are
+    /// absent despite CIS 6.1.2/6.1.4: denying them would break username
+    /// resolution everywhere.
     ///
-    /// * Every pattern is literal and at most three components deep. A rule
-    ///   deeper than `MAX_COMPONENTS` never matches, and for a role with
-    ///   `allow_file_access` that reads as *allowed* -- a deny that silently
-    ///   inverts is worse than no rule.
-    /// * Nothing here is a path a process opens in normal operation. The
-    ///   `file_open` hook carries no read/write distinction, so a deny denies
-    ///   the open outright: `/etc/passwd` and `/etc/group` are therefore
-    ///   absent, despite CIS 6.1.2/6.1.4, because denying them would break
-    ///   username resolution in every confined service.
+    /// By the same token these roles do **not** suit an authentication daemon.
+    /// `/etc/shadow` is what `unix_chkpwd` reads to verify a password and
+    /// `/root/` holds `authorized_keys`, so an enrolled sshd cannot
+    /// authenticate anyone.
+    ///
+    /// The depth limit is on the path being opened, not on these patterns: a
+    /// file more than `MAX_COMPONENTS` deep under one of these directories
+    /// reports no rule and is therefore allowed. Shallow patterns do not
+    /// prevent that; nothing in the policy layer can.
     ///
     /// Returned as data so a caller building a role over `DefineRole` gets the
     /// same protection as the shipped JSON. They are asserted equal in tests.
@@ -305,6 +309,7 @@ impl SecretPatterns {
             "/etc/audit/",
             "/etc/sudoers",
             "/etc/sudoers.d/",
+            "/etc/ssh/",
         ]
         .iter()
         .map(|p| PathPattern {

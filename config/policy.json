@@ -281,7 +281,7 @@
       }
     },
     "cis_baseline": {
-      "_comment": "CIS-aligned tier 1 of 3. Safe to enrol anything into, sshd included: it denies only paths no process legitimately opens. See docs/cis-mapping.md.",
+      "_comment": "CIS-aligned tier 1 of 3. Confines a service without restricting what it may do: file access, network and exec are all granted. NOT for an authentication daemon -- see docs/cis-mapping.md.",
       "id": 14,
       "name": "cis_baseline",
       "flags": {
@@ -303,14 +303,15 @@
         {"pattern": "/boot/", "allow": false},
         {"pattern": "/etc/audit/", "allow": false},
         {"pattern": "/etc/sudoers", "allow": false},
-        {"pattern": "/etc/sudoers.d/", "allow": false}
+        {"pattern": "/etc/sudoers.d/", "allow": false},
+        {"pattern": "/etc/ssh/", "allow": false}
       ],
       "network_rules": [],
       "execution_rules": [],
       "require_signed_binary": false
     },
     "cis_service": {
-      "_comment": "CIS-aligned tier 2 of 3. A network daemon: no exec, and the SSH host keys are denied. See docs/cis-mapping.md.",
+      "_comment": "CIS-aligned tier 2 of 3. A network daemon that never spawns anything. See docs/cis-mapping.md.",
       "id": 15,
       "name": "cis_service",
       "flags": {
@@ -340,7 +341,7 @@
       "require_signed_binary": false
     },
     "cis_isolated": {
-      "_comment": "CIS-aligned tier 3 of 3. Tier 2 with no network at all. See docs/cis-mapping.md.",
+      "_comment": "CIS-aligned tier 3 of 3. Tier 2 with no sockets at all, AF_UNIX included. See docs/cis-mapping.md.",
       "id": 16,
       "name": "cis_isolated",
       "flags": {

@@ -10,10 +10,11 @@ those — it denies operations at runtime. A scanner will not score a host highe
 because these roles are enrolled.
 
 What the roles give you is enforcement of the *thing several of those controls
-are protecting*, at a point a file mode cannot reach: a process that already has
-root still cannot open `/etc/shadow` if it is enrolled in one of these roles.
-That is worth having. It is not compliance, and a compliance report should not
-claim it is.
+are protecting*, at a point a file mode cannot reach: an enrolled process that
+already has root cannot open `/etc/shadow` **by that path**. That is worth
+having. It is not compliance, and a compliance report should not claim it is.
+It is also not containment — see [Limits](#limits-you-should-read-before-relying-on-this),
+which is the section that matters most on this page.
 
 ## The three tiers
 
@@ -27,18 +28,22 @@ Each tier is strictly stricter than the one above it; nothing a looser tier
 denies is permitted by a tighter one. That is asserted in the test suite, not
 just documented here.
 
-- **`cis_baseline`** — safe to enrol anything into, including sshd. It denies
-  only paths no process opens in normal operation, and grants file access,
-  network and exec.
-- **`cis_service`** — a network daemon. No exec, and the SSH host keys are
-  denied as well.
-- **`cis_isolated`** — `cis_service` with no network at all.
+- **`cis_baseline`** — confines a service without restricting what it may do:
+  file access, network and exec are all granted, and only the deny set below
+  applies.
+- **`cis_service`** — a network daemon that never spawns anything.
+- **`cis_isolated`** — `cis_service` with no sockets at all.
+
+**None of the three suits an authentication daemon.** All of them deny
+`/etc/shadow`, which `unix_chkpwd` reads to verify a password, and `/root/`,
+which holds `authorized_keys` — so an enrolled sshd cannot authenticate anyone.
+Confine the services sshd leads to, not sshd.
 
 All three deny ptrace, kernel module loading and BPF program loading.
 
 ## The deny set
 
-Shared by all three tiers:
+All three tiers carry the same set; they differ only in flags.
 
 ```
 /etc/shadow  /etc/gshadow  /etc/shadow-  /etc/gshadow-
@@ -46,9 +51,8 @@ Shared by all three tiers:
 /boot/
 /etc/audit/
 /etc/sudoers  /etc/sudoers.d/
+/etc/ssh/
 ```
-
-`cis_service` and `cis_isolated` add `/etc/ssh/`.
 
 Available to Rust callers building a role at runtime as
 `SecretPatterns::cis_hardening()`; a test asserts the preset and the shipped
@@ -76,9 +80,9 @@ neither replaces the other.
 | --- | --- | --- |
 | 6.1.3, 6.1.5 | `/etc/shadow`, `/etc/gshadow` mode `0000`/`0640` | deny the open outright |
 | 6.1.7, 6.1.9 | `/etc/shadow-`, `/etc/gshadow-` modes | deny the open outright |
-| 5.2.2 | SSH private host key files mode `0600` | `cis_service`/`cis_isolated` deny `/etc/ssh/` |
+| 5.2.2 | SSH private host key files mode `0600` | deny `/etc/ssh/` |
 | 1.4 | bootloader config owned by root, mode `0600` | deny `/boot/` |
-| 4.1 | auditd installed, enabled, configured | deny writes to `/etc/audit/` |
+| 4.1 | auditd installed, enabled, configured | deny `/etc/audit/` — reads too, so do not enrol auditd |
 | 4.1.16 | changes to `/etc/sudoers` are collected | deny `/etc/sudoers`, `/etc/sudoers.d/` |
 
 The difference matters when you write it down: CIS restricts *who* may open the
@@ -145,7 +149,35 @@ denying specific binaries.
 daemonless mode they are written and then lost when the bootstrap exits. A rule
 that silently stops applying is worse than one that was never written.
 
-**No pattern deeper than three components.** A path longer than
-`MAX_COMPONENTS` (16) reports no rule rather than a decision, and for a role
-with `allow_file_access: true` that reads as *allowed*. A deep deny would
-silently invert; every pattern here is shallow enough that it cannot.
+**No pattern deeper than three components** — but read the next section before
+assuming that buys anything, because the depth limit is on the path being
+opened, not on the pattern.
+
+## Limits you should read before relying on this
+
+These roles raise the cost of an attack. They do not contain a hostile root
+process, and three specific gaps are worth knowing by name.
+
+**A path too deep to walk escapes every deny.** `collect_path_components` stops
+after `MAX_COMPONENTS` (16) without reaching the task's root, marks the walk
+truncated, and the state machine then reports *no rule* — which, for roles that
+grant `allow_file_access`, means allowed. So a file more than 16 components deep
+under `/root/` is not denied, and no arrangement of patterns changes that. It is
+a property of the walk, not of the policy. Pinned by
+`a_path_too_deep_to_collect_escapes_the_cis_denies`.
+
+**A hard link defeats a path deny.** There is no `lsm/path_link` or
+`lsm/inode_link` hook — the object declares twelve programs and none of them
+covers link creation. An enrolled process with the capability to link can
+`link("/etc/shadow", "/tmp/s")` and then open `/tmp/s`, which matches no rule.
+`fs.protected_hardlinks=1` blocks this for a process that does not own the file
+and cannot read it, so it is not a gap for an unprivileged service — but it is
+one for root. Deny by path, and the path is what is denied.
+
+**`allow_network: false` blocks AF_UNIX too.** `check_network_access` returns
+"no rule" for any family that is not AF_INET or AF_INET6, and `socket_bind` and
+`socket_connect` then fall back to the flag. So `cis_isolated` denies Unix
+domain sockets as well as IP: an enrolled workload loses `/dev/log`, D-Bus, and
+any local database socket. This is the most common surprise on first enrolment.
+`cis_service` is the tier to reach for when a workload needs local sockets but
+no network.

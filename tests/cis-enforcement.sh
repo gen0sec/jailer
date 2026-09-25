@@ -115,20 +115,33 @@ v=$(verdict "python3 /var/tmp/unixprobe.py")
 [ "$v" = allowed ] && ok "not enrolled: AF_UNIX bind allowed" || bad "control: AF_UNIX allowed" "got $v"
 
 phase "CIS 3.4.x -- module autoload is denied"
-# Must run against a protocol whose module is NOT loaded: if it is already in,
-# no autoload is requested and the test proves nothing either way. Checked
-# rather than assumed, because rmmod fails silently when the module is in use.
+# Three ways this measurement goes wrong, all of them silently:
+#
+#  1. The module is already loaded, so no autoload is requested and both sides
+#     behave identically. rmmod fails when the module is in use, so "I unloaded
+#     it" is not the same as "it is unloaded" -- check, do not assume.
+#  2. The module is not available in this kernel at all. Both sides then fail
+#     with EAFNOSUPPORT, which reads exactly like a clean negative. Observed
+#     with rds on a stock Ubuntu cloud kernel.
+#  3. The address family does not autoload on socket() even when the module
+#     exists -- tipc behaves this way. The enrolled call is refused, the module
+#     stays out, and it looks like enforcement while proving nothing.
+#
+# So the CONTROL is what validates the probe: unless an unenrolled process can
+# make the module appear, this test is inconclusive rather than passing or
+# failing. Enrolled runs first, because the control loads the module.
 PROTO=""
-for m in sctp rds tipc; do
+for m in sctp dccp tipc; do
+  q "modinfo $m >/dev/null 2>&1" || continue
   [ "$(q "lsmod | grep -c '^$m '")" = "0" ] && { PROTO=$m; break; }
 done
+
 if [ -z "$PROTO" ]; then
-  bad "an unloaded protocol module to test with" "sctp, rds and tipc are all loaded; reboot the target"
+  echo "  SKIP no protocol module is both available and unloaded -- reboot the target"
 else
-  ok "testing with $PROTO (not currently loaded)"
   case "$PROTO" in
     sctp) fam="socket.AF_INET, socket.SOCK_STREAM, 132" ;;
-    rds)  fam="21, socket.SOCK_SEQPACKET, 0" ;;
+    dccp) fam="socket.AF_INET, 6, 0" ;;
     tipc) fam="30, socket.SOCK_STREAM, 0" ;;
   esac
   q "cat > /var/tmp/modprobe.py <<PY
@@ -136,17 +149,20 @@ import socket
 s = socket.socket($fam)
 s.close()
 PY"
-  # Enrolled FIRST: the control would load the module and destroy the state.
-  v=$(verdict "/usr/local/bin/isolated-python /var/tmp/modprobe.py")
-  still=$(q "lsmod | grep -c '^$PROTO '")
-  if [ "$v" = denied ] && [ "$still" = "0" ]; then
-    ok "enrolled: $PROTO autoload denied and the module stayed out"
+  enrolled=$(verdict "/usr/local/bin/isolated-python /var/tmp/modprobe.py")
+  after_enrolled=$(q "lsmod | grep -c '^$PROTO '")
+  control=$(verdict "python3 /var/tmp/modprobe.py")
+  after_control=$(q "lsmod | grep -c '^$PROTO '")
+
+  if [ "$control" != allowed ] || [ "$after_control" = "0" ]; then
+    echo "  SKIP $PROTO does not autoload on socket() here (control was $control,"
+    echo "       module still absent), so nothing can be concluded either way"
+  elif [ "$enrolled" = denied ] && [ "$after_enrolled" = "0" ]; then
+    ok "enrolled: $PROTO autoload denied, module stayed out; control loaded it"
   else
-    bad "enrolled: $PROTO autoload denied" "verdict=$v, loaded=$still"
+    bad "enrolled: $PROTO autoload denied" \
+        "enrolled=$enrolled module_after=$after_enrolled -- the control proved the probe works"
   fi
-  v=$(verdict "python3 /var/tmp/modprobe.py")
-  [ "$v" = allowed ] && ok "not enrolled: $PROTO autoload succeeded (control)" \
-    || bad "control: $PROTO autoload" "got $v"
 fi
 
 echo

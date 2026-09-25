@@ -1452,6 +1452,140 @@ mod path_walk_semantics {
             "a path outside /etc must not pick up the /etc rule by being deep"
         );
     }
+
+    // ---- the CIS-aligned default roles ------------------------------------
+    //
+    // `docs/cis-mapping.md` tells an operator these roles block access to the
+    // credential, boot and audit paths CIS protects with file modes. That claim
+    // is only worth making if the encoded rules actually decide that way, so it
+    // is asserted here against the same walk the kernel performs -- not against
+    // the JSON, which would only prove the file says what the file says.
+
+    const CIS_POLICY: &str = include_str!("../../config/policy.json");
+
+    /// A shipped role's file rules, as the encoder receives them.
+    fn cis_role(name: &str) -> (u32, Vec<(String, bool)>) {
+        let v: serde_json::Value = serde_json::from_str(CIS_POLICY).expect("valid json");
+        let role = &v["roles"][name];
+        assert!(!role.is_null(), "the shipped policy has no role '{name}'");
+        let id = role["id"].as_u64().expect("role id") as u32;
+        let rules = role["file_paths"]
+            .as_array()
+            .expect("file_paths")
+            .iter()
+            .map(|r| {
+                (
+                    r["pattern"].as_str().expect("pattern").to_string(),
+                    r["allow"].as_bool().unwrap_or(true),
+                )
+            })
+            .collect();
+        (id, rules)
+    }
+
+    fn cis_decision(name: &str, path: &str) -> Decision {
+        let (id, rules) = cis_role(name);
+        let borrowed: Vec<(&str, bool)> = rules.iter().map(|(p, a)| (p.as_str(), *a)).collect();
+        let mut map = HashMap::new();
+        for (k, v) in path_state_entries_for_role(id, &borrowed)
+            .expect("a shipped CIS role must not be refused")
+        {
+            map.insert(k, v);
+        }
+        walk(&map, id, path, false)
+    }
+
+    const CIS_ROLES: [&str; 3] = ["cis_baseline", "cis_service", "cis_isolated"];
+
+    /// What every tier claims to deny, written as paths a process would really
+    /// open rather than as the patterns themselves -- a rule that matched only
+    /// its own literal would pass a pattern-shaped test and protect nothing.
+    const DENIED_EVERYWHERE: [&str; 9] = [
+        "/etc/shadow",
+        "/etc/gshadow",
+        "/etc/shadow-",
+        "/etc/gshadow-",
+        "/root/.ssh/id_ed25519",
+        "/boot/grub/grub.cfg",
+        "/etc/audit/auditd.conf",
+        "/etc/sudoers",
+        "/etc/sudoers.d/90-local",
+    ];
+
+    #[test]
+    fn every_cis_role_denies_the_credential_boot_and_audit_paths() {
+        for role in CIS_ROLES {
+            for path in DENIED_EVERYWHERE {
+                assert_eq!(
+                    cis_decision(role, path),
+                    Decision::Deny,
+                    "{role} must deny {path}"
+                );
+            }
+        }
+    }
+
+    /// Discrimination control. A role whose rules denied everything would pass
+    /// the test above and be useless, and one whose deny went inert would fail
+    /// it -- this separates the two.
+    #[test]
+    fn the_cis_roles_still_allow_what_they_do_not_name() {
+        for role in CIS_ROLES {
+            for path in ["/usr/bin/curl", "/var/lib/myapp/state.db", "/etc/hostname"] {
+                assert_eq!(
+                    cis_decision(role, path),
+                    Decision::NoRule,
+                    "{role} decides nothing about {path}, so the role flag applies"
+                );
+            }
+        }
+    }
+
+    /// `/etc/ssh` holds the host private keys (CIS 5.2.2). The confined tiers
+    /// deny it; `cis_baseline` deliberately does not, because it has to stay
+    /// safe to enrol anything into -- including sshd, which cannot start
+    /// without reading them.
+    #[test]
+    fn only_the_confined_tiers_deny_the_ssh_host_keys() {
+        assert_eq!(
+            cis_decision("cis_baseline", "/etc/ssh/ssh_host_ed25519_key"),
+            Decision::NoRule,
+            "cis_baseline must not deny the host keys: sshd could not start"
+        );
+        for role in ["cis_service", "cis_isolated"] {
+            assert_eq!(
+                cis_decision(role, "/etc/ssh/ssh_host_ed25519_key"),
+                Decision::Deny,
+                "{role} must deny the SSH host keys"
+            );
+        }
+    }
+
+    /// The tiers are a ladder, and that is the whole documentation: anything a
+    /// looser tier denies, a tighter one must deny too. Without this the three
+    /// could drift into three unrelated roles that merely share a prefix.
+    #[test]
+    fn each_tier_denies_everything_the_looser_tier_denies() {
+        let probes: Vec<String> = DENIED_EVERYWHERE
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("/etc/ssh/ssh_host_ed25519_key".to_string()))
+            .collect();
+
+        for pair in CIS_ROLES.windows(2) {
+            let (looser, tighter) = (pair[0], pair[1]);
+            for path in &probes {
+                if cis_decision(looser, path) == Decision::Deny {
+                    assert_eq!(
+                        cis_decision(tighter, path),
+                        Decision::Deny,
+                        "{looser} denies {path} but {tighter}, which is meant to be \
+                         stricter, does not"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -320,6 +320,31 @@ BpfJailer loads roles from a JSON policy file. The daemon searches for the polic
 | 6 | web_with_db | Allowed | Ports 80, 443, 5432, 3306, 6379 | Blocked |
 | 7 | worker | Allowed | Ports 443, 5432, 6379, 5672 | Allowed |
 
+### CIS-aligned roles
+
+Three further roles form a ladder for hardening an existing service, each
+strictly stricter than the one before. All three deny ptrace, kernel module
+loading and BPF program loading, and deny access to the credential, boot and
+audit paths the CIS Distribution Independent Linux Benchmark protects with file
+modes.
+
+| Role ID | Name | File Access | Network | Exec |
+|---------|------|-------------|---------|------|
+| 14 | cis_baseline | Allowed, credential paths denied | Allowed | Allowed |
+| 15 | cis_service | Same denies | Allowed | Blocked |
+| 16 | cis_isolated | Same denies | Blocked, AF_UNIX included | Blocked |
+
+All three carry the same deny set and differ only in flags. **None of them
+suits an authentication daemon** — they deny `/etc/shadow` and `/root/`, so an
+enrolled sshd cannot authenticate anyone.
+
+They enforce nothing until a process is enrolled in one; the shipped policy
+enrols nothing. **These roles do not make a host pass a CIS scan** — the
+benchmark's controls are written against file modes and installed packages, not
+runtime enforcement. [docs/cis-mapping.md](docs/cis-mapping.md) sets out control
+by control what they do enforce, what they only complement, and what they cannot
+express.
+
 ## Network Port/Protocol Filtering
 
 BpfJailer supports fine-grained network control with per-port TCP/UDP rules.

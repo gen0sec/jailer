@@ -4,7 +4,7 @@
 
 ## Acknowledgments
 
-> **Note**: This is an independent implementation and is not the same project as Meta's solution. While BpfJailer is functionally similar and inspired by the original idea and design by **Liam Wisehart**,  **Justin Nga**, **Carl El Khoury**, **Mansee Chadha**  at **Meta**, this is a separate codebase developed independently. We extend our gratitude for the vision and foundational concepts that inspired this work.
+> **Note**: This is an independent implementation and is not the same project as Meta's solution. While BpfJailer is functionally similar and inspired by the original idea and design by **Liam Wisehart**,  **Justin Ngai**, **Carl El Khoury**, **Mansee Chadha**  at **Meta**, this is a separate codebase developed independently. We extend our gratitude for the vision and foundational concepts that inspired this work.
 
 # Community
 [![Join us on Discord](https://img.shields.io/badge/Join%20Us%20on-Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/jzsW5Q6s9q)
